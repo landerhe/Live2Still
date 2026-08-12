@@ -11,7 +11,7 @@ import SwiftUI
 struct Live2StillApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            LivePhotoRootView()
         }
     }
 }
