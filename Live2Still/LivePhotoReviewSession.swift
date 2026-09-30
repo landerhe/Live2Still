@@ -5,16 +5,27 @@
 
 import Observation
 
+enum LivePhotoReviewAction: Equatable {
+    case convert(String)
+    case delete(String)
+    case keep(String)
+}
+
 @MainActor
 @Observable
 final class LivePhotoReviewSession {
     private(set) var deck: [LivePhotoItem] = []
     private(set) var index: Int = 0
+    /// IDs selected to apply as still conversions.
     private(set) var convertQueue: Set<String> = []
+    /// Ordered membership of the still queue (cells stay until removed).
     private(set) var convertQueueOrder: [String] = []
+    /// IDs selected to apply as deletions.
     private(set) var deleteQueue: Set<String> = []
+    /// Ordered membership of the delete queue (cells stay until removed).
     private(set) var deleteQueueOrder: [String] = []
     private(set) var keptCount: Int = 0
+    private(set) var lastAction: LivePhotoReviewAction?
 
     var hasQueuedActions: Bool {
         !convertQueueOrder.isEmpty || !deleteQueueOrder.isEmpty
@@ -22,6 +33,14 @@ final class LivePhotoReviewSession {
 
     var queuedActionCount: Int {
         convertQueue.count + deleteQueue.count
+    }
+
+    var queuedMembershipCount: Int {
+        convertQueueOrder.count + deleteQueueOrder.count
+    }
+
+    var canUndo: Bool {
+        lastAction != nil && index > 0
     }
 
     func queuedItemsForConvert(from items: [LivePhotoItem]) -> [LivePhotoItem] {
@@ -69,6 +88,7 @@ final class LivePhotoReviewSession {
         }
         deck = newDeck
         index = 0
+        lastAction = nil
     }
 
     /// Starts or restarts when the deck was emptied (e.g. after library sync).
@@ -85,34 +105,116 @@ final class LivePhotoReviewSession {
         deleteQueue = []
         deleteQueueOrder = []
         keptCount = 0
+        lastAction = nil
+    }
+
+    /// Starts a fresh deck while preserving queued still/delete work.
+    func startNewDeckPreservingQueue(deck newDeck: [LivePhotoItem]) {
+        deck = newDeck
+        index = 0
+        lastAction = nil
     }
 
     func recordConvert() {
         guard let item = currentItem else { return }
-        removeFromDeleteQueue(item.id)
-        convertQueue.insert(item.id)
+        removeFromDeleteQueueMembership(item.id)
         if !convertQueueOrder.contains(item.id) {
             convertQueueOrder.append(item.id)
         }
+        convertQueue.insert(item.id)
+        lastAction = .convert(item.id)
         index += 1
     }
 
     func recordDelete() {
         guard let item = currentItem else { return }
-        removeFromConvertQueue(item.id)
-        deleteQueue.insert(item.id)
+        removeFromConvertQueueMembership(item.id)
         if !deleteQueueOrder.contains(item.id) {
             deleteQueueOrder.append(item.id)
         }
+        deleteQueue.insert(item.id)
+        lastAction = .delete(item.id)
         index += 1
     }
 
+    func recordKeep() {
+        guard let item = currentItem else { return }
+        keptCount += 1
+        lastAction = .keep(item.id)
+        index += 1
+    }
+
+    /// One-step undo of the last swipe/button action.
+    @discardableResult
+    func undoLastAction() -> Bool {
+        guard let action = lastAction, index > 0 else { return false }
+
+        index -= 1
+        switch action {
+        case .convert(let id):
+            convertQueue.remove(id)
+            convertQueueOrder.removeAll { $0 == id }
+        case .delete(let id):
+            deleteQueue.remove(id)
+            deleteQueueOrder.removeAll { $0 == id }
+        case .keep:
+            keptCount = max(0, keptCount - 1)
+        }
+        lastAction = nil
+        return true
+    }
+
+    /// Toggle apply-selection without removing the cell from the queue section.
+    func toggleConvertQueue(_ id: String) {
+        if convertQueue.contains(id) {
+            convertQueue.remove(id)
+        } else {
+            deleteQueue.remove(id)
+            convertQueue.insert(id)
+            if !convertQueueOrder.contains(id) {
+                convertQueueOrder.append(id)
+            }
+        }
+    }
+
+    func toggleDeleteQueue(_ id: String) {
+        if deleteQueue.contains(id) {
+            deleteQueue.remove(id)
+        } else {
+            convertQueue.remove(id)
+            deleteQueue.insert(id)
+            if !deleteQueueOrder.contains(id) {
+                deleteQueueOrder.append(id)
+            }
+        }
+    }
+
+    func removeConvertQueuedEntirely(ids: [String]) {
+        let idSet = Set(ids)
+        convertQueue.subtract(idSet)
+        convertQueueOrder.removeAll { idSet.contains($0) }
+    }
+
+    func removeDeleteQueuedEntirely(ids: [String]) {
+        let idSet = Set(ids)
+        deleteQueue.subtract(idSet)
+        deleteQueueOrder.removeAll { idSet.contains($0) }
+    }
+
     func removeFromConvertQueue(_ id: String) {
+        removeFromConvertQueueMembership(id)
+    }
+
+    func removeFromDeleteQueue(_ id: String) {
+        removeFromDeleteQueueMembership(id)
+    }
+
+    private func removeFromConvertQueueMembership(_ id: String) {
         convertQueue.remove(id)
         convertQueueOrder.removeAll { $0 == id }
     }
 
-    func removeFromDeleteQueue(_ id: String) {
+    private func removeFromDeleteQueueMembership(_ id: String) {
         deleteQueue.remove(id)
         deleteQueueOrder.removeAll { $0 == id }
     }
@@ -131,33 +233,9 @@ final class LivePhotoReviewSession {
         deleteQueueOrder.removeAll { ids.contains($0) }
     }
 
-    func toggleConvertQueue(_ id: String) {
-        if convertQueue.contains(id) {
-            removeFromConvertQueue(id)
-        } else {
-            removeFromDeleteQueue(id)
-            convertQueue.insert(id)
-            if !convertQueueOrder.contains(id) {
-                convertQueueOrder.append(id)
-            }
-        }
-    }
-
-    func toggleDeleteQueue(_ id: String) {
-        if deleteQueue.contains(id) {
-            removeFromDeleteQueue(id)
-        } else {
-            removeFromConvertQueue(id)
-            deleteQueue.insert(id)
-            if !deleteQueueOrder.contains(id) {
-                deleteQueueOrder.append(id)
-            }
-        }
-    }
-
     func selectAllConvertQueued(ids: [String]) {
         for id in ids {
-            removeFromDeleteQueue(id)
+            deleteQueue.remove(id)
             convertQueue.insert(id)
             if !convertQueueOrder.contains(id) {
                 convertQueueOrder.append(id)
@@ -165,14 +243,14 @@ final class LivePhotoReviewSession {
         }
     }
 
+    /// Unchecks all still items for Apply without removing them from the queue section.
     func deselectAllConvertQueued() {
         convertQueue = []
-        convertQueueOrder = []
     }
 
     func selectAllDeleteQueued(ids: [String]) {
         for id in ids {
-            removeFromConvertQueue(id)
+            convertQueue.remove(id)
             deleteQueue.insert(id)
             if !deleteQueueOrder.contains(id) {
                 deleteQueueOrder.append(id)
@@ -180,26 +258,31 @@ final class LivePhotoReviewSession {
         }
     }
 
+    /// Unchecks all delete items for Apply without removing them from the queue section.
     func deselectAllDeleteQueued() {
         deleteQueue = []
-        deleteQueueOrder = []
     }
 
-    func recordKeep() {
-        guard currentItem != nil else { return }
-        keptCount += 1
-        index += 1
-    }
-
-    /// Drops assets no longer in the library; advances past missing current card.
+    /// Drops assets no longer in the library; adjusts index when earlier cards disappear.
     func syncWithAvailableIDs(_ validIDs: Set<String>) {
+        let previousIndex = index
+        let removedBeforeIndex = deck.prefix(previousIndex).filter { !validIDs.contains($0.id) }.count
+
         deck = deck.filter { validIDs.contains($0.id) }
         convertQueue = convertQueue.intersection(validIDs)
         convertQueueOrder = convertQueueOrder.filter { validIDs.contains($0) }
         deleteQueue = deleteQueue.intersection(validIDs)
         deleteQueueOrder = deleteQueueOrder.filter { validIDs.contains($0) }
-        if index > deck.count {
-            index = deck.count
+
+        index = min(max(0, previousIndex - removedBeforeIndex), deck.count)
+
+        if let lastAction {
+            switch lastAction {
+            case .convert(let id), .delete(let id), .keep(let id):
+                if !validIDs.contains(id) {
+                    self.lastAction = nil
+                }
+            }
         }
     }
 }

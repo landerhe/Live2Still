@@ -36,8 +36,11 @@ struct LivePhotoRootView: View {
         }
 
         guard let store else { return }
-        await store.prepare()
+        // Commit a real app screen before Photos performs any framework or
+        // library work. On-device Photos setup can be delayed by iCloud or a
+        // large library, and must never hold the first visible frame hostage.
         isBootstrapped = true
+        await store.prepare()
     }
 }
 

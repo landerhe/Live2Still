@@ -8,10 +8,12 @@ import SwiftUI
 struct LivePhotoQueuedReviewSheet: View {
     let store: LivePhotoLibraryStore
     @Bindable var session: LivePhotoReviewSession
+    @Binding var removeOriginal: Bool
     var isProcessing: Bool = false
     var onApply: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
     @Environment(\.displayScale) private var displayScale
+
     private var convertItems: [LivePhotoItem] {
         store.livePhotoItems(forOrderedIDs: session.convertQueueOrder)
     }
@@ -31,7 +33,7 @@ struct LivePhotoQueuedReviewSheet: View {
                     ContentUnavailableView {
                         Label("Nothing Queued", systemImage: "photo.stack")
                     } description: {
-                        Text("Use Still or Delete while swiping. Tap Apply on the main screen when ready.")
+                        Text("Use Still or Delete while swiping. Tap Apply when ready.")
                     }
                 } else {
                     ScrollView {
@@ -83,6 +85,9 @@ struct LivePhotoQueuedReviewSheet: View {
                                         session.deselectAllConvertQueued()
                                     }
                                 }
+                                Button("Remove still from queue", role: .destructive) {
+                                    session.removeConvertQueuedEntirely(ids: convertItems.map(\.id))
+                                }
                             }
                             if !deleteItems.isEmpty {
                                 Button("Select all delete") {
@@ -92,6 +97,9 @@ struct LivePhotoQueuedReviewSheet: View {
                                     Button("Deselect all delete") {
                                         session.deselectAllDeleteQueued()
                                     }
+                                }
+                                Button("Remove delete from queue", role: .destructive) {
+                                    session.removeDeleteQueuedEntirely(ids: deleteItems.map(\.id))
                                 }
                             }
                         } label: {
@@ -110,9 +118,15 @@ struct LivePhotoQueuedReviewSheet: View {
     }
 
     private var queueSheetActionBar: some View {
-        ViewThatFits(in: .horizontal) {
-            queueSheetActionBarHorizontal
-            queueSheetActionBarVertical
+        VStack(spacing: 10) {
+            Toggle("Remove original Live Photo", isOn: $removeOriginal)
+                .font(LivePhotoDesign.actionBarFont)
+                .disabled(isProcessing || convertItems.isEmpty)
+
+            ViewThatFits(in: .horizontal) {
+                queueSheetActionBarHorizontal
+                queueSheetActionBarVertical
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -163,7 +177,7 @@ struct LivePhotoQueuedReviewSheet: View {
             }
             .buttonStyle(.glassProminent)
             .disabled(isProcessing || session.queuedActionCount == 0)
-            .accessibilityHint("Applies queued still conversions and deletions")
+            .accessibilityHint("Applies selected still conversions and deletions")
         }
     }
 
@@ -241,27 +255,26 @@ private struct QueuedSelectableCell: View {
             isSelected: isSelected,
             accessibilityLabelText: accessibilityLabelText,
             onTap: onTap,
-            onRetry: thumbnailState.isFailed ? { Task { await loadThumbnail() } } : nil
+            onRetry: thumbnailState.isFailed ? { Task { await loadThumbnail(forceLoading: true) } } : nil
         )
         .task(id: item.id) {
-            await loadThumbnail()
+            await loadThumbnail(forceLoading: thumbnailState.image == nil)
         }
     }
 
-    private func loadThumbnail() async {
+    private func loadThumbnail(forceLoading: Bool) async {
         loadToken += 1
         let token = loadToken
-        thumbnailState = .loading
+        if forceLoading {
+            thumbnailState = .loading
+        }
 
         let result = await store.requestThumbnail(
             for: item.asset,
             targetSize: targetSize
         )
 
-        guard !Task.isCancelled, token == loadToken else {
-            thumbnailState = .loading
-            return
-        }
+        guard !Task.isCancelled, token == loadToken else { return }
         thumbnailState = result.displayState
     }
 }

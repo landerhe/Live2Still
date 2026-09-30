@@ -42,14 +42,6 @@ struct LivePhotoReviewView: View {
         .onChange(of: store.items.count) { _, _ in
             onSyncWithLibrary()
         }
-        .fullScreenCover(isPresented: $showQueuedReview) {
-            LivePhotoQueuedReviewSheet(
-                store: store,
-                session: session,
-                isProcessing: isQueueProcessing,
-                onApply: onApplyQueuedActions
-            )
-        }
     }
 
     // MARK: - Active review
@@ -89,7 +81,17 @@ struct LivePhotoReviewView: View {
                 .padding(.bottom, 8)
         }
         .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                if session.canUndo {
+                    Button {
+                        _ = session.undoLastAction()
+                    } label: {
+                        Image(systemName: "arrow.uturn.backward")
+                    }
+                    .accessibilityLabel("Undo last swipe")
+                    .disabled(isQueueProcessing)
+                }
+
                 Button {
                     showSwipeOnboardingTip = true
                 } label: {
@@ -201,9 +203,12 @@ struct LivePhotoReviewView: View {
     }
 
     private func prefetchUpcoming() {
-        let availableWidth = max(1, reviewPrefetchAvailableWidth - 40)
-        let container = LivePhotoThumbnailSizing.estimatedReviewCardContainer(
-            availableWidth: availableWidth
+        let container = LivePhotoThumbnailSizing.cardContainerSize(
+            in: CGSize(
+                width: max(1, reviewPrefetchAvailableWidth - 40),
+                height: LivePhotoDesign.swipeCardMaxHeight
+            ),
+            horizontalPadding: 0
         )
         let targetSize = LivePhotoThumbnailSizing.targetSize(
             container: container,
@@ -279,7 +284,9 @@ struct LivePhotoReviewView: View {
                 .buttonStyle(.glassProminent)
             }
             Button("Swipe Again") {
-                session.reset(deck: store.makeReviewDeck(maxCount: LivePhotoDesign.reviewDeckMaxCount))
+                session.startNewDeckPreservingQueue(
+                    deck: store.makeReviewDeck(maxCount: LivePhotoDesign.reviewDeckMaxCount)
+                )
             }
             .buttonStyle(.glass)
         }
@@ -415,7 +422,9 @@ private struct LivePhotoCardStack: View {
     }
 
     private func swipeOverlayOpacity(for progress: Double) -> Double {
-        min(1, max(0.18, progress))
+        let reveal = LivePhotoDesign.swipeOverlayRevealProgress
+        guard progress > reveal else { return 0 }
+        return min(1, (progress - reveal) / (1 - reveal))
     }
 
     private var swipeOverlays: some View {
@@ -465,15 +474,16 @@ private struct LivePhotoCardStack: View {
             pressStartedAt = Date()
 
         case .pendingPress:
-            if shouldBeginSwiping(distance: distance) {
+            if distance >= LivePhotoDesign.swipeDragMinimumDistance {
                 beginSwiping(translation: translation)
-            } else if let pressStartedAt,
+            } else if distance <= LivePhotoDesign.livePressMaximumMovement,
+                      let pressStartedAt,
                       Date().timeIntervalSince(pressStartedAt) >= LivePhotoDesign.livePressMinimumDuration {
                 beginLivePreviewIfNeeded()
             }
 
         case .playingLive:
-            if shouldBeginSwiping(distance: distance) {
+            if distance >= LivePhotoDesign.swipeDragMinimumDistance {
                 beginSwiping(translation: translation)
             }
 
@@ -506,11 +516,6 @@ private struct LivePhotoCardStack: View {
         case .idle:
             break
         }
-    }
-
-    private func shouldBeginSwiping(distance: CGFloat) -> Bool {
-        distance >= LivePhotoDesign.livePressMaximumMovement
-            || distance >= LivePhotoDesign.swipeDragMinimumDistance
     }
 
     private func beginSwiping(translation: CGSize) {
@@ -701,7 +706,9 @@ struct LivePhotoCardImage: View {
     private func loadThumbnail() async {
         loadToken += 1
         let token = loadToken
-        thumbnailState = .loading
+        if thumbnailState.image == nil {
+            thumbnailState = .loading
+        }
 
         let result = await store.requestThumbnail(
             for: item.asset,

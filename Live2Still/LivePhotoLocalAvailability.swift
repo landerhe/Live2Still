@@ -4,6 +4,7 @@
 //
 
 import Photos
+import UIKit
 
 struct LocalLibraryFilterProgress: Sendable {
     let scanned: Int
@@ -22,11 +23,10 @@ enum LivePhotoLocalAvailability {
         cacheLock.unlock()
     }
 
-    /// True when the still photo resource is stored on-device (not iCloud-only).
+    /// True when the still can be decoded without network access (on-device, not iCloud-only).
     ///
-    /// Reads Photos-database metadata via `PHAssetResource` (`locallyAvailable`, then
-    /// `fileSize`). This is orders of magnitude faster than per-asset `PHImageManager`
-    /// probes and is the standard approach for declutter / storage apps at scale.
+    /// Uses a synchronous `PHImageManager` request with `isNetworkAccessAllowed = false`.
+    /// Must not be called on the main thread for large batches.
     nonisolated static func isAssetAvailableOffline(_ asset: PHAsset) -> Bool {
         let id = asset.localIdentifier
 
@@ -37,7 +37,7 @@ enum LivePhotoLocalAvailability {
         }
         cacheLock.unlock()
 
-        let available = checkPhotoResourceLocal(for: asset)
+        let available = checkPhotoAvailableLocally(for: asset)
 
         cacheLock.lock()
         availabilityCache[id] = available
@@ -116,21 +116,34 @@ enum LivePhotoLocalAvailability {
         return filtered
     }
 
-    nonisolated private static func checkPhotoResourceLocal(for asset: PHAsset) -> Bool {
-        let resources = PHAssetResource.assetResources(for: asset)
-        guard let photo = resources.first(where: { $0.type == .photo }) else {
-            return false
-        }
-        return isResourceLocallyAvailable(photo)
-    }
+    nonisolated private static func checkPhotoAvailableLocally(for asset: PHAsset) -> Bool {
+        let options = PHImageRequestOptions()
+        options.isNetworkAccessAllowed = false
+        options.isSynchronous = true
+        options.deliveryMode = .fastFormat
+        options.resizeMode = .fast
 
-    nonisolated private static func isResourceLocallyAvailable(_ resource: PHAssetResource) -> Bool {
-        if let locallyAvailable = resource.value(forKey: "locallyAvailable") as? Bool {
-            return locallyAvailable
+        var available = false
+        PHImageManager.default().requestImage(
+            for: asset,
+            targetSize: CGSize(width: 16, height: 16),
+            contentMode: .aspectFit,
+            options: options
+        ) { image, info in
+            if info?[PHImageCancelledKey] as? Bool == true {
+                available = false
+                return
+            }
+            if info?[PHImageErrorKey] != nil {
+                available = false
+                return
+            }
+            if info?[PHImageResultIsInCloudKey] as? Bool == true {
+                available = false
+                return
+            }
+            available = image != nil
         }
-        if let size = resource.value(forKey: "fileSize") as? CLong, size > 0 {
-            return true
-        }
-        return false
+        return available
     }
 }

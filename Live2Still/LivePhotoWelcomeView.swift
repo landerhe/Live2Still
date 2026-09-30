@@ -15,10 +15,6 @@ struct LivePhotoWelcomeView: View {
 
     @State private var symbolActive = false
 
-    private var canContinue: Bool {
-        !store.isLoading
-    }
-
     private var loadingLabel: String {
         if store.loadingStatusMessage.isEmpty {
             return store.isLoading ? "Scanning your Live Photos…" : "Ready"
@@ -77,7 +73,9 @@ struct LivePhotoWelcomeView: View {
             Button("Continue", action: onContinue)
                 .buttonStyle(.glassProminent)
                 .frame(maxWidth: .infinity)
-                .disabled(!canContinue)
+
+            LivePhotoLegalFooter()
+                .padding(.top, 4)
         }
         .padding(.horizontal, LivePhotoDesign.launchHorizontalPadding)
         .padding(.vertical, 32)

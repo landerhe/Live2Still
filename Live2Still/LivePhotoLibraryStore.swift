@@ -81,6 +81,8 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
     private var pendingLibraryChangeTask: Task<Void, Never>?
     private let libraryChangeDebounceNanoseconds: UInt64 = 300_000_000
     private var isPrepared = false
+    private var cachedAllItemIDs: Set<String>?
+    private var cachedAllItemIDsRevision = -1
 
     override init() {
         showLocalLibraryOnly = UserDefaults.standard.bool(
@@ -94,9 +96,9 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
         guard !isPrepared else { return }
         isPrepared = true
 
-        let status = await Task.detached(priority: .userInitiated) {
-            PHPhotoLibrary.authorizationStatus(for: .readWrite)
-        }.value
+        // This is a cheap status lookup. Keeping it on the calling actor also
+        // avoids delaying initial UI behind a detached Photos framework task.
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
 
         PHPhotoLibrary.shared().register(self)
         startNetworkMonitoring()
@@ -726,12 +728,25 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
         if showsLocalLibraryOnly {
             return Set(items.map(\.id))
         }
-        guard let fetchResult else { return Set(items.map(\.id)) }
+
+        if let cachedAllItemIDs, cachedAllItemIDsRevision == libraryRevision {
+            return cachedAllItemIDs
+        }
+
+        guard let fetchResult else {
+            let ids = Set(items.map(\.id))
+            cachedAllItemIDs = ids
+            cachedAllItemIDsRevision = libraryRevision
+            return ids
+        }
+
         var ids = Set<String>()
         ids.reserveCapacity(fetchResult.count)
         for index in 0 ..< fetchResult.count {
             ids.insert(fetchResult.object(at: index).localIdentifier)
         }
+        cachedAllItemIDs = ids
+        cachedAllItemIDsRevision = libraryRevision
         return ids
     }
 
@@ -856,7 +871,4 @@ private final class ContinuationResumeGuard<T>: @unchecked Sendable {
         continuation.resume(returning: value)
     }
 }
-
-}
-
 

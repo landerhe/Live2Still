@@ -6,6 +6,7 @@
 import ImageIO
 import Observation
 import Photos
+import UniformTypeIdentifiers
 import UIKit
 
 enum LivePhotoError: LocalizedError {
@@ -15,6 +16,7 @@ enum LivePhotoError: LocalizedError {
     case invalidImageData
     case conversionFailed(underlying: Error?)
     case batchPartialFailure(succeeded: Int, failed: Int)
+    case alreadyConverting
 
     var errorDescription: String? {
         switch self {
@@ -30,6 +32,8 @@ enum LivePhotoError: LocalizedError {
             underlying?.localizedDescription ?? "Converting to a still photo failed."
         case .batchPartialFailure(let succeeded, let failed):
             "Converted \(succeeded) photo\(succeeded == 1 ? "" : "s"). \(failed) failed."
+        case .alreadyConverting:
+            "A conversion is already in progress."
         }
     }
 }
@@ -39,6 +43,10 @@ struct BatchConversionResult: Sendable {
     let failed: Int
     let errors: [Error]
     let convertedSourceIDs: [String]
+    /// Source IDs that failed during prepare (safe to retry).
+    let failedSourceIDs: [String]
+    /// True when stills were created but the user canceled (or delete failed) removing originals.
+    let originalsRemovalCanceled: Bool
     /// Total bytes freed when originals were removed; nil if originals were kept.
     let bytesSaved: Int64?
     let bytesSavedIsEstimate: Bool
@@ -64,17 +72,25 @@ final class LivePhotoConverter {
     private(set) var isSaving = false
     private(set) var conversionProgress: (completed: Int, total: Int)?
 
+    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+
     func convert(
         assets: [PHAsset],
         removeOriginal: Bool,
         progress: ((Int, Int) -> Void)? = nil
     ) async throws -> BatchConversionResult {
+        guard !isConverting else {
+            throw LivePhotoError.alreadyConverting
+        }
+
         guard !assets.isEmpty else {
             return BatchConversionResult(
                 succeeded: 0,
                 failed: 0,
                 errors: [],
                 convertedSourceIDs: [],
+                failedSourceIDs: [],
+                originalsRemovalCanceled: false,
                 bytesSaved: nil,
                 bytesSavedIsEstimate: false
             )
@@ -84,17 +100,20 @@ final class LivePhotoConverter {
 
         isConverting = true
         isSaving = false
+        beginBackgroundTaskIfNeeded()
         reportProgress(completed: 0, total: totalPhotos, callback: progress)
         defer {
             isConverting = false
             isSaving = false
             conversionProgress = nil
+            endBackgroundTaskIfNeeded()
         }
 
         let prepareOutcome = await prepareAssets(assets, totalPhotos: totalPhotos, progress: progress)
         let prepared = prepareOutcome.prepared
         let prepareFailed = prepareOutcome.failed
         let prepareErrors = prepareOutcome.errors
+        let failedSourceIDs = prepareOutcome.failedSourceIDs
 
         guard !prepared.isEmpty else {
             throw prepareErrors.first ?? LivePhotoError.conversionFailed(underlying: nil)
@@ -103,18 +122,34 @@ final class LivePhotoConverter {
         isSaving = true
         reportProgress(completed: totalPhotos, total: totalPhotos, callback: progress)
 
+        let committed: [PreparedConversion]
         do {
-            let committed = try await commitBatch(prepared: prepared, removeOriginal: removeOriginal)
-            try await applyBatchPostCreationMetadata(prepared: committed)
+            // Transaction 1: create stills only (survives if the user later cancels delete).
+            committed = try await commitCreations(prepared: prepared)
+            // Best-effort metadata; stills already exist if this fails.
+            try? await applyBatchPostCreationMetadata(prepared: committed)
             reportProgress(completed: totalPhotos, total: totalPhotos, callback: progress)
         } catch {
             cleanupTemporaryFiles(prepared)
             throw LivePhotoError.conversionFailed(underlying: error)
         }
 
+        var originalsRemovalCanceled = false
+        var didRemoveOriginals = false
+
+        if removeOriginal {
+            do {
+                // Transaction 2: delete originals only after stills exist.
+                try await deleteOriginals(prepared: committed)
+                didRemoveOriginals = true
+            } catch {
+                originalsRemovalCanceled = true
+            }
+        }
+
         cleanupTemporaryFiles(prepared)
 
-        let succeeded = prepared.count
+        let succeeded = committed.count
         let failed = prepareFailed
 
         if failed > 0, succeeded == 0 {
@@ -123,9 +158,9 @@ final class LivePhotoConverter {
 
         let bytesSaved: Int64?
         let bytesSavedIsEstimate: Bool
-        if removeOriginal {
-            bytesSaved = prepared.reduce(0) { $0 + $1.savedBytes }
-            bytesSavedIsEstimate = prepared.contains(where: \.savedBytesIsEstimate)
+        if didRemoveOriginals {
+            bytesSaved = committed.reduce(0) { $0 + $1.savedBytes }
+            bytesSavedIsEstimate = committed.contains(where: \.savedBytesIsEstimate)
         } else {
             bytesSaved = nil
             bytesSavedIsEstimate = false
@@ -135,10 +170,27 @@ final class LivePhotoConverter {
             succeeded: succeeded,
             failed: failed,
             errors: prepareErrors,
-            convertedSourceIDs: prepared.map(\.sourceAsset.localIdentifier),
+            convertedSourceIDs: committed.map(\.sourceAsset.localIdentifier),
+            failedSourceIDs: failedSourceIDs,
+            originalsRemovalCanceled: originalsRemovalCanceled,
             bytesSaved: bytesSaved,
             bytesSavedIsEstimate: bytesSavedIsEstimate
         )
+    }
+
+    // MARK: - Background task
+
+    private func beginBackgroundTaskIfNeeded() {
+        guard backgroundTaskID == .invalid else { return }
+        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "Live2Still.convert") { [weak self] in
+            self?.endBackgroundTaskIfNeeded()
+        }
+    }
+
+    private func endBackgroundTaskIfNeeded() {
+        guard backgroundTaskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTaskID)
+        backgroundTaskID = .invalid
     }
 
     // MARK: - Prepare (bounded parallelism)
@@ -147,6 +199,7 @@ final class LivePhotoConverter {
         var prepared: [PreparedConversion]
         var failed: Int
         var errors: [Error]
+        var failedSourceIDs: [String]
     }
 
     private func prepareAssets(
@@ -158,20 +211,22 @@ final class LivePhotoConverter {
         var prepared: [PreparedConversion] = []
         prepared.reserveCapacity(total)
         var prepareErrors: [Error] = []
+        var failedSourceIDs: [String] = []
         var prepareFailed = 0
         var completedCount = 0
 
-        await withTaskGroup(of: Result<PreparedConversion, Error>.self) { group in
+        await withTaskGroup(of: (String, Result<PreparedConversion, Error>).self) { group in
             var iterator = assets.makeIterator()
 
             func enqueueNext() {
                 guard let asset = iterator.next() else { return }
+                let id = asset.localIdentifier
                 group.addTask {
                     do {
                         let item = try await Self.prepareConversion(for: asset)
-                        return .success(item)
+                        return (id, .success(item))
                     } catch {
-                        return .failure(error)
+                        return (id, .failure(error))
                     }
                 }
             }
@@ -180,7 +235,7 @@ final class LivePhotoConverter {
                 enqueueNext()
             }
 
-            for await result in group {
+            for await (id, result) in group {
                 completedCount += 1
                 switch result {
                 case .success(let item):
@@ -188,6 +243,7 @@ final class LivePhotoConverter {
                 case .failure(let error):
                     prepareFailed += 1
                     prepareErrors.append(error)
+                    failedSourceIDs.append(id)
                 }
 
                 reportProgress(completed: completedCount, total: totalPhotos, callback: progress)
@@ -199,7 +255,8 @@ final class LivePhotoConverter {
         return PrepareOutcome(
             prepared: prepared,
             failed: prepareFailed,
-            errors: prepareErrors
+            errors: prepareErrors,
+            failedSourceIDs: failedSourceIDs
         )
     }
 
@@ -217,7 +274,7 @@ final class LivePhotoConverter {
     nonisolated private static func prepareConversion(for asset: PHAsset) async throws -> PreparedConversion {
         guard asset.mediaSubtypes.contains(.photoLive) else {
             throw LivePhotoError.notLivePhoto
-        } 
+        }
 
         let photoResource = try photoResource(from: asset)
         let (fileURL, stillBytes) = try await writePhotoResourceToTemporaryFile(photoResource)
@@ -237,11 +294,10 @@ final class LivePhotoConverter {
         )
     }
 
-    // MARK: - Single batch commit (one system delete prompt for all removals)
+    // MARK: - Create stills (no deletes)
 
-    private func commitBatch(
-        prepared: [PreparedConversion],
-        removeOriginal: Bool
+    private func commitCreations(
+        prepared: [PreparedConversion]
     ) async throws -> [PreparedConversion] {
         var placeholderIDs: [String?] = Array(repeating: nil, count: prepared.count)
 
@@ -256,11 +312,6 @@ final class LivePhotoConverter {
                 request.location = item.sourceAsset.location
                 placeholderIDs[index] = request.placeholderForCreatedAsset?.localIdentifier
             }
-
-            if removeOriginal {
-                let assetsToDelete = prepared.map(\.sourceAsset) as NSArray
-                PHAssetChangeRequest.deleteAssets(assetsToDelete)
-            }
         }
 
         return zip(prepared, placeholderIDs).map { item, placeholderID in
@@ -274,6 +325,13 @@ final class LivePhotoConverter {
                 savedBytesIsEstimate: item.savedBytesIsEstimate,
                 placeholderLocalIdentifier: placeholderID
             )
+        }
+    }
+
+    private func deleteOriginals(prepared: [PreparedConversion]) async throws {
+        let assetsToDelete = prepared.map(\.sourceAsset) as NSArray
+        try await PHPhotoLibrary.shared().performChanges {
+            PHAssetChangeRequest.deleteAssets(assetsToDelete)
         }
     }
 
@@ -412,15 +470,29 @@ final class LivePhotoConverter {
         return photo
     }
 
+    nonisolated private static func fileExtension(for resource: PHAssetResource) -> String {
+        let utiString = resource.uniformTypeIdentifier
+        if let type = UTType(utiString), let ext = type.preferredFilenameExtension {
+            return ext
+        }
+        let original = resource.originalFilename as NSString
+        let ext = original.pathExtension
+        if !ext.isEmpty {
+            return ext.lowercased()
+        }
+        return "jpg"
+    }
+
     nonisolated private static func writePhotoResourceToTemporaryFile(
         _ resource: PHAssetResource
     ) async throws -> (URL, Int64) {
+        let ext = fileExtension(for: resource)
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension("jpg")
+            .appendingPathExtension(ext)
 
         let bytesWritten = try await streamResourceToFile(resource, destination: url)
-        guard bytesWritten > 0, isValidJPEG(at: url) else {
+        guard bytesWritten > 0, isValidImage(at: url) else {
             try? FileManager.default.removeItem(at: url)
             throw LivePhotoError.invalidImageData
         }
@@ -464,7 +536,7 @@ final class LivePhotoConverter {
         }
     }
 
-    nonisolated private static func isValidJPEG(at url: URL) -> Bool {
+    nonisolated private static func isValidImage(at url: URL) -> Bool {
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
             return false
         }

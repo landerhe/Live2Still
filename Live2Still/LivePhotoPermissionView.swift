@@ -40,7 +40,7 @@ struct LivePhotoPermissionView: View {
                 )
                 permissionTip(
                     icon: "photo.stack",
-                    text: "For the full album experience, choose **Allow Access to All Photos** when iOS asks."
+                    text: "Limited access works. Choose **Full Access** only if you want to browse your entire Live Photo library at once."
                 )
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -53,12 +53,15 @@ struct LivePhotoPermissionView: View {
                 .frame(maxWidth: .infinity)
 
             Text(
-                "If iOS does not ask again, photo access was already granted. Open Settings → Privacy & Security → Photos → Live2Still to change access or choose Full Access."
+                "You can change access later in Settings → Privacy & Security → Photos → Live2Still."
             )
             .font(.caption)
             .foregroundStyle(.tertiary)
             .multilineTextAlignment(.center)
             .padding(.top, 4)
+
+            LivePhotoLegalFooter()
+                .padding(.top, 8)
         }
         .padding(.horizontal, LivePhotoDesign.launchHorizontalPadding)
         .padding(.vertical, 32)

@@ -31,13 +31,17 @@ enum LivePhotoDesign {
     static let libraryActionBarHeight: CGFloat = 52
     static let swipeCardMaxHeight: CGFloat = 500
     static let swipeThreshold: CGFloat = 110
-    static let swipeDragMinimumDistance: CGFloat = 8
-    static let livePressMinimumDuration: TimeInterval = 0.5
-    static let livePressMaximumMovement: CGFloat = 10
+    static let swipeDragMinimumDistance: CGFloat = 24
+    static let livePressMinimumDuration: TimeInterval = 0.45
+    static let livePressMaximumMovement: CGFloat = 18
 
     static let launchHorizontalPadding: CGFloat = 24
     static let launchVerticalSpacing: CGFloat = 20
     static let launchIconSize: CGFloat = 56
     static let welcomeOnboardingKey = "hasCompletedWelcomeOnboarding"
     static let showLocalLibraryOnlyKey = "showLocalLibraryOnly"
+    static let removeOriginalKey = "removeOriginalLivePhoto"
+    static let gridCacheWindowRadius = 40
+    static let albumConvertBatchCap = 100
+    static let swipeOverlayRevealProgress: Double = 0.15
 }

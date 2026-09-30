@@ -18,7 +18,7 @@ struct LivePhotoSelectionCell: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        Button(action: onTap) {
+        Button(action: onRetry ?? onTap) {
             GeometryReader { geometry in
                 ZStack {
                     thumbnailLayer(size: geometry.size)
@@ -54,10 +54,9 @@ struct LivePhotoSelectionCell: View {
                         Image(systemName: "photo.badge.exclamationmark")
                             .font(.title3)
                             .foregroundStyle(.secondary)
-                        if let onRetry {
-                            Button("Retry", action: onRetry)
+                        if onRetry != nil {
+                            Text("Tap to retry")
                                 .font(.caption2.weight(.medium))
-                                .buttonStyle(.plain)
                         }
                     }
                 }
@@ -78,8 +77,9 @@ struct LivePhotoSelectionCell: View {
                         .symbolRenderingMode(.palette)
                         .foregroundStyle(
                             .white,
-                            isSelected ? Color.accentColor : Color.primary.opacity(0.35)
+                            isSelected ? Color.accentColor : Color.white
                         )
+                        .background(.black.opacity(0.55), in: Circle())
                         .shadow(radius: 1)
                         .modifier(ConditionalBounceEffect(isActive: isSelected, reduceMotion: reduceMotion))
                         .padding(LivePhotoDesign.cellBadgeInset)

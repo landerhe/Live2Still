@@ -11,7 +11,8 @@ import UIKit
 /// UIKit Live Photo view; playback is controlled externally (long-press on swipe card).
 struct LivePhotoPlaybackView: UIViewRepresentable {
     let livePhoto: PHLivePhoto
-    @Binding var isPlaying: Bool
+    let isPlaying: Bool
+    let onPlaybackEnded: () -> Void
 
     func makeUIView(context: Context) -> PHLivePhotoView {
         let view = PHLivePhotoView()
@@ -23,10 +24,12 @@ struct LivePhotoPlaybackView: UIViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(isPlaying: $isPlaying)
+        Coordinator(onPlaybackEnded: onPlaybackEnded)
     }
 
     func updateUIView(_ uiView: PHLivePhotoView, context: Context) {
+        context.coordinator.onPlaybackEnded = onPlaybackEnded
+
         if uiView.livePhoto != livePhoto {
             uiView.livePhoto = livePhoto
             context.coordinator.isPlayingBack = false
@@ -49,11 +52,11 @@ struct LivePhotoPlaybackView: UIViewRepresentable {
     }
 
     final class Coordinator: NSObject, PHLivePhotoViewDelegate {
-        @Binding var isPlaying: Bool
+        var onPlaybackEnded: () -> Void
         var isPlayingBack = false
 
-        init(isPlaying: Binding<Bool>) {
-            _isPlaying = isPlaying
+        init(onPlaybackEnded: @escaping () -> Void) {
+            self.onPlaybackEnded = onPlaybackEnded
         }
 
         func livePhotoView(
@@ -61,9 +64,7 @@ struct LivePhotoPlaybackView: UIViewRepresentable {
             didEndPlaybackWith playbackStyle: PHLivePhotoViewPlaybackStyle
         ) {
             isPlayingBack = false
-            if isPlaying {
-                isPlaying = false
-            }
+            onPlaybackEnded()
         }
     }
 }
@@ -82,6 +83,7 @@ struct LivePhotoSwipeCardContent: View {
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var livePhoto: PHLivePhoto?
+    @State private var isLoadingLivePhoto = false
 
     private var targetSize: CGSize {
         LivePhotoThumbnailSizing.targetSize(
@@ -111,10 +113,16 @@ struct LivePhotoSwipeCardContent: View {
 
             if isTop, isPressingLive {
                 if let livePhoto {
-                    LivePhotoPlaybackView(livePhoto: livePhoto, isPlaying: $isPressingLive)
-                        .clipShape(cardShape)
-                        .allowsHitTesting(false)
-                        .transition(.opacity)
+                    LivePhotoPlaybackView(
+                        livePhoto: livePhoto,
+                        isPlaying: true,
+                        onPlaybackEnded: {
+                            isPressingLive = false
+                        }
+                    )
+                    .clipShape(cardShape)
+                    .allowsHitTesting(false)
+                    .transition(.opacity)
                 } else {
                     cardShape
                         .fill(Color.black.opacity(0.15))
@@ -140,22 +148,28 @@ struct LivePhotoSwipeCardContent: View {
             guard isTop else { return }
             onDelete?()
         }
-        .task(id: item.id) {
-            guard isTop else { return }
-            await loadLivePhotoIfNeeded()
+        .onChange(of: isPressingLive) { _, pressing in
+            guard isTop, pressing else { return }
+            Task { await loadLivePhotoIfNeeded() }
         }
         .onChange(of: isTop) { _, nowTop in
-            if nowTop {
-                Task { await loadLivePhotoIfNeeded() }
-            } else {
+            if !nowTop {
                 isPressingLive = false
                 livePhoto = nil
+                isLoadingLivePhoto = false
             }
+        }
+        .onChange(of: item.id) { _, _ in
+            livePhoto = nil
+            isLoadingLivePhoto = false
+            isPressingLive = false
         }
     }
 
     private func loadLivePhotoIfNeeded() async {
-        guard isTop, livePhoto == nil else { return }
+        guard isTop, livePhoto == nil, !isLoadingLivePhoto else { return }
+        isLoadingLivePhoto = true
+        defer { isLoadingLivePhoto = false }
         livePhoto = await store.requestLivePhoto(
             for: item.asset,
             targetSize: targetSize,

@@ -17,12 +17,14 @@ struct ContentView: View {
     @State private var showQueuedReview = false
     @State private var selectedTab: AppTab = .album
     @State private var selectedIDs: Set<String> = []
-    @State private var removeOriginal = true
+    @AppStorage(LivePhotoDesign.removeOriginalKey) private var removeOriginal = true
     @State private var showAlert = false
     @State private var alertTitle = ""
     @State private var alertMessage = ""
     @State private var showDeleteConfirm = false
     @State private var showApplyQueueConfirm = false
+    @State private var showSelectAllConfirm = false
+    @State private var showAbout = false
     @State private var pendingConversionIDs: Set<String>?
     @State private var pendingDeleteIDs: Set<String>?
     @State private var bannerMessage: String?
@@ -34,7 +36,7 @@ struct ContentView: View {
     private enum FailedOperation {
         case conversion(Set<String>)
         case delete(Set<String>)
-        case queue
+        case queue(convertIDs: Set<String>, deleteIDs: Set<String>)
     }
 
     private enum AppTab: Hashable {
@@ -124,6 +126,30 @@ struct ContentView: View {
                 }
             } message: {
                 Text(applyQueueConfirmationMessage)
+            }
+            .confirmationDialog(
+                "Select all Live Photos?",
+                isPresented: $showSelectAllConfirm,
+                titleVisibility: .visible
+            ) {
+                Button("Select All \(store.livePhotoCount)") {
+                    selectedIDs = store.allItemIDs()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This selects all \(store.livePhotoCount) Live Photos in your library, including ones not currently on screen.")
+            }
+            .fullScreenCover(isPresented: $showQueuedReview) {
+                LivePhotoQueuedReviewSheet(
+                    store: store,
+                    session: reviewSession,
+                    removeOriginal: $removeOriginal,
+                    isProcessing: converter.isConverting || applyProgress != nil,
+                    onApply: beginApplyQueuedActions
+                )
+            }
+            .sheet(isPresented: $showAbout) {
+                LivePhotoAboutSheet()
             }
         }
     }
@@ -316,13 +342,38 @@ struct ContentView: View {
 
     @ViewBuilder
     private var albumBottomBar: some View {
-        Button {
-            beginConversion()
-        } label: {
-            convertBarButtonLabel
+        HStack(spacing: 12) {
+            Menu {
+                Button {
+                    removeOriginal = false
+                } label: {
+                    Label("Keep Originals", systemImage: removeOriginal ? "circle" : "checkmark.circle.fill")
+                }
+
+                Button {
+                    removeOriginal = true
+                } label: {
+                    Label("Remove Originals After Saving", systemImage: removeOriginal ? "checkmark.circle.fill" : "circle")
+                }
+            } label: {
+                Label(
+                    removeOriginal ? "Remove Originals" : "Keep Originals",
+                    systemImage: removeOriginal ? "trash" : "livephoto"
+                )
+                .font(LivePhotoDesign.actionBarFont)
+            }
+            .buttonStyle(.glass)
+            .disabled(converter.isConverting || applyProgress != nil)
+            .accessibilityHint("Choose what happens to the original Live Photos after still copies are saved")
+
+            Button {
+                beginConversion()
+            } label: {
+                convertBarButtonLabel
+            }
+            .buttonStyle(.glassProminent)
+            .disabled(selectedIDs.isEmpty || converter.isConverting || applyProgress != nil)
         }
-        .buttonStyle(.glassProminent)
-        .disabled(selectedIDs.isEmpty || converter.isConverting || applyProgress != nil)
     }
 
     private var swipeQueueStatusSummary: String {
@@ -393,7 +444,7 @@ struct ContentView: View {
         ContentUnavailableView {
             Label("Photo Access Required", systemImage: "photo.on.rectangle.angled")
         } description: {
-            Text("Allow access to your photo library in Settings so Live2Still can show your Live Photos. Choose Full Access for the complete album experience.")
+            Text("Allow access to your photo library in Settings so Live2Still can show your Live Photos. Limited Access works; choose Full Access if you want the complete album.")
         } actions: {
             Button("Open Settings") {
                 openSettings()
@@ -414,7 +465,7 @@ struct ContentView: View {
             } else if store.isLimited {
                 Text("No Live Photos in your current selection. Use Add Photos in the menu to include more, or allow full library access in Settings.")
             } else {
-                Text("Take a Live Photo with the Camera app, or on Simulator drag one into the Photos window.")
+                Text("Take a Live Photo with the Camera app, then return here to convert it to a still.")
             }
         } actions: {
             if store.isLimited {
@@ -445,7 +496,7 @@ struct ContentView: View {
                     if allItemsSelected {
                         selectedIDs.removeAll()
                     } else {
-                        selectedIDs = store.allItemIDs()
+                        showSelectAllConfirm = true
                     }
                 } label: {
                     Image(systemName: allItemsSelected ? "checkmark.circle.fill" : "checkmark.circle")
@@ -458,8 +509,8 @@ struct ContentView: View {
                     } label: {
                         Image(systemName: "photo.stack")
                     }
-                    .badge(reviewSession.queuedActionCount)
-                    .accessibilityLabel("Swipe queue, \(reviewSession.queuedActionCount) items")
+                    .badge(reviewSession.queuedMembershipCount)
+                    .accessibilityLabel("Swipe queue, \(reviewSession.queuedMembershipCount) items")
                 }
 
                 settingsMenu
@@ -472,8 +523,8 @@ struct ContentView: View {
                     } label: {
                         Image(systemName: "photo.stack")
                     }
-                    .badge(reviewSession.queuedActionCount)
-                    .accessibilityLabel("Swipe queue, \(reviewSession.queuedActionCount) items")
+                    .badge(reviewSession.queuedMembershipCount)
+                    .accessibilityLabel("Swipe queue, \(reviewSession.queuedMembershipCount) items")
                 }
 
                 settingsMenu
@@ -512,6 +563,12 @@ struct ContentView: View {
                 } label: {
                     Label("Add Photos to Access…", systemImage: "photo.badge.plus")
                 }
+            }
+            Divider()
+            Button {
+                showAbout = true
+            } label: {
+                Label("About", systemImage: "info.circle")
             }
         } label: {
             Image(systemName: "ellipsis.circle")
@@ -553,17 +610,14 @@ struct ContentView: View {
     }
 
     private func syncReviewSessionWithLibrary() {
-        var validIDs = store.allItemIDs()
-        validIDs.formUnion(reviewSession.convertQueue)
-        validIDs.formUnion(reviewSession.deleteQueue)
-        validIDs.formUnion(Set(reviewSession.deck.map(\.id)))
-        reviewSession.syncWithAvailableIDs(validIDs)
+        reviewSession.syncWithAvailableIDs(store.allItemIDs())
     }
 
     // MARK: - Queue apply
 
     private func beginApplyQueuedActions() {
         guard reviewSession.hasQueuedActions else { return }
+        guard !converter.isConverting, applyProgress == nil else { return }
 
         pendingConversionIDs = reviewSession.convertQueue
         pendingDeleteIDs = reviewSession.deleteQueue
@@ -582,15 +636,15 @@ struct ContentView: View {
         if deleteCount > 0 {
             return true
         }
-        if convertCount > 1, removeOriginal {
+        if convertCount > 0, removeOriginal {
             return true
         }
         return false
     }
 
     private func performQueuedActions() async {
-        let convertIDs = reviewSession.convertQueue
-        let deleteIDs = reviewSession.deleteQueue
+        let convertIDs = pendingConversionIDs ?? reviewSession.convertQueue
+        let deleteIDs = pendingDeleteIDs ?? reviewSession.deleteQueue
         let totalSteps = convertIDs.count + deleteIDs.count
 
         guard totalSteps > 0 else {
@@ -641,20 +695,30 @@ struct ContentView: View {
         }
 
         let assets = store.assets(for: ids)
-        guard !assets.isEmpty else { return }
+        guard !assets.isEmpty else {
+            reviewSession.removeDeletedFromQueue(ids)
+            if assets.isEmpty, !ids.isEmpty {
+                presentBanner("Some queued photos were already removed from your library.")
+            }
+            return
+        }
 
-        progress?(assets.count, assets.count)
+        progress?(0, assets.count)
 
         do {
             try await store.deleteAssets(assets)
-            selectedIDs.subtract(ids)
-            reviewSession.removeDeletedFromQueue(ids)
+            let deletedIDs = Set(assets.map(\.localIdentifier))
+            selectedIDs.subtract(deletedIDs)
+            reviewSession.removeDeletedFromQueue(deletedIDs)
+            // Drop IDs that vanished before delete could run.
+            reviewSession.removeDeletedFromQueue(ids.subtracting(deletedIDs))
             reviewSession.syncWithAvailableIDs(store.allItemIDs())
 
             let count = assets.count
             presentBanner(
                 "Deleted \(count) Live Photo\(count == 1 ? "" : "s") from your library."
             )
+            progress?(count, count)
         } catch {
             lastFailedOperation = .delete(ids)
             presentAlert(title: "Delete Failed", message: error.localizedDescription)
@@ -669,10 +733,20 @@ struct ContentView: View {
 
     private func beginConversion(ids: Set<String>) {
         guard !ids.isEmpty else { return }
+        guard !converter.isConverting, applyProgress == nil else { return }
 
-        pendingConversionIDs = ids
+        var conversionIDs = ids
+        if conversionIDs.count > LivePhotoDesign.albumConvertBatchCap {
+            let capped = Array(conversionIDs.prefix(LivePhotoDesign.albumConvertBatchCap))
+            conversionIDs = Set(capped)
+            presentBanner(
+                "Converting \(LivePhotoDesign.albumConvertBatchCap) now. The rest stay selected."
+            )
+        }
 
-        if removeOriginal && ids.count > 1 {
+        pendingConversionIDs = conversionIDs
+
+        if removeOriginal {
             showDeleteConfirm = true
         } else {
             Task { await performConversion() }
@@ -689,7 +763,11 @@ struct ContentView: View {
         }
 
         let assets = store.assets(for: ids)
-        guard !assets.isEmpty else { return }
+        guard !assets.isEmpty else {
+            reviewSession.removeConvertedFromQueue(ids)
+            presentBanner("Some queued photos were already removed from your library.")
+            return
+        }
 
         let fromSwipe = selectedTab == .swipe
 
@@ -707,10 +785,16 @@ struct ContentView: View {
             }
 
             if result.failed > 0 {
-                lastFailedOperation = skipApplyProgressReset ? .queue : .conversion(ids)
+                lastFailedOperation = skipApplyProgressReset
+                    ? .queue(convertIDs: Set(result.failedSourceIDs), deleteIDs: pendingDeleteIDs ?? [])
+                    : .conversion(Set(result.failedSourceIDs))
                 presentAlert(
                     title: "Partially Completed",
                     message: conversionResultMessage(result: result, removeOriginal: removeOriginal)
+                )
+            } else if result.originalsRemovalCanceled {
+                presentBanner(
+                    conversionResultMessage(result: result, removeOriginal: removeOriginal)
                 )
             } else {
                 presentBanner(conversionResultMessage(result: result, removeOriginal: removeOriginal))
@@ -725,12 +809,16 @@ struct ContentView: View {
         lastFailedOperation = nil
         switch operation {
         case .conversion(let ids):
+            guard !ids.isEmpty else { return }
             pendingConversionIDs = ids
             Task { await performConversion() }
         case .delete(let ids):
+            guard !ids.isEmpty else { return }
             pendingDeleteIDs = ids
             Task { await performBatchDelete() }
-        case .queue:
+        case .queue(let convertIDs, let deleteIDs):
+            pendingConversionIDs = convertIDs
+            pendingDeleteIDs = deleteIDs
             Task { await performQueuedActions() }
         }
     }
@@ -748,7 +836,9 @@ struct ContentView: View {
             message = "Converted \(count) photo\(count == 1 ? "" : "s"). \(result.failed) failed."
         } else {
             message = "Converted \(count) \(photoWord) to \(stillWord)."
-            if removeOriginal {
+            if result.originalsRemovalCanceled {
+                message += " Originals were kept because deletion was canceled."
+            } else if removeOriginal {
                 message += " Original\(count == 1 ? "" : "s") removed."
             }
         }

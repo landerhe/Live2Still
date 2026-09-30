@@ -28,7 +28,7 @@ enum LivePhotoAccessibility {
         if let date = asset.creationDate {
             parts.append(dateFormatter.string(from: date))
         }
-        if total > 0 {
+        if total > 0, index >= 0 {
             parts.append("\(index + 1) of \(total)")
         }
         return parts.joined(separator: ", ")

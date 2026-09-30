@@ -6,7 +6,7 @@
 import Photos
 
 enum LivePhotoStorageSavings {
-    /// Typical paired-video size when metadata is unavailable (e.g. iCloud-only).
+    /// Typical paired-video size when exact resource sizes are unavailable (e.g. iCloud-only).
     nonisolated static let estimatedPairedVideoBytes: Int64 = 3_000_000
 
     nonisolated static func savedBytes(bundleBytes: Int64, stillBytes: Int64) -> Int64 {
@@ -14,37 +14,21 @@ enum LivePhotoStorageSavings {
     }
 
     /// Estimated storage freed when replacing a Live Photo with a still of `stillBytes`.
+    /// Uses public Photos APIs only; falls back to a paired-video estimate when exact
+    /// resource byte sizes are not available.
     nonisolated static func estimatedStorageSavings(
         for asset: PHAsset,
         stillBytes: Int64
     ) -> (savedBytes: Int64, isEstimate: Bool) {
         let resources = PHAssetResource.assetResources(for: asset)
-        var bundleSum: Int64 = 0
-        for resource in resources {
-            if let size = resourceByteSize(resource) {
-                bundleSum += size
-            }
+        let hasPairedVideo = resources.contains { $0.type == .pairedVideo }
+
+        if hasPairedVideo {
+            return (estimatedPairedVideoBytes, true)
         }
 
-        if bundleSum > 0 {
-            return (
-                savedBytes(bundleBytes: bundleSum, stillBytes: stillBytes),
-                false
-            )
-        }
-
-        if let video = resources.first(where: { $0.type == .pairedVideo }),
-           let videoSize = resourceByteSize(video) {
-            return (videoSize, true)
-        }
-
-        return (estimatedPairedVideoBytes, true)
-    }
-
-    /// Undocumented `fileSize` via KVC; nil when unknown or zero (common for iCloud-only assets).
-    nonisolated private static func resourceByteSize(_ resource: PHAssetResource) -> Int64? {
-        guard let size = resource.value(forKey: "fileSize") as? CLong, size > 0 else { return nil }
-        return Int64(size)
+        // Still-only fallback (unexpected for Live Photos); report no reliable savings.
+        return (max(0, estimatedPairedVideoBytes), true)
     }
 }
 
