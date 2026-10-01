@@ -10,6 +10,8 @@ struct LivePhotoQueuedReviewSheet: View {
     @Bindable var session: LivePhotoReviewSession
     @Binding var removeOriginal: Bool
     var isProcessing: Bool = false
+    var summaryMessage: String?
+    var attentionIDs: Set<String> = []
     var onApply: (() -> Void)?
     @Environment(\.dismiss) private var dismiss
     @Environment(\.displayScale) private var displayScale
@@ -38,6 +40,12 @@ struct LivePhotoQueuedReviewSheet: View {
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 20) {
+                            if let summaryMessage {
+                                Text(summaryMessage)
+                                    .font(.subheadline)
+                                    .foregroundStyle(attentionIDs.isEmpty ? Color.secondary : Color.orange)
+                                    .padding(.horizontal, 14)
+                            }
                             if !convertItems.isEmpty {
                                 queueSection(
                                     title: "Turn into still",
@@ -225,6 +233,14 @@ struct LivePhotoQueuedReviewSheet: View {
                             : "Not \(selectedAccessibilityPrefix.lowercased())",
                         onTap: { onTap(item.id) }
                     )
+                    .overlay(alignment: .bottomLeading) {
+                        if attentionIDs.contains(item.id) {
+                            Image(systemName: "exclamationmark.circle.fill")
+                                .foregroundStyle(.orange)
+                                .padding(6)
+                                .accessibilityLabel("Needs attention")
+                        }
+                    }
                 }
             }
         }
@@ -269,12 +285,13 @@ private struct QueuedSelectableCell: View {
             thumbnailState = .loading
         }
 
-        let result = await store.requestThumbnail(
+        let events = store.imageEvents(
             for: item.asset,
             targetSize: targetSize
         )
-
-        guard !Task.isCancelled, token == loadToken else { return }
-        thumbnailState = result.displayState
+        for await event in events {
+            guard !Task.isCancelled, token == loadToken else { return }
+            thumbnailState = thumbnailState.applying(event)
+        }
     }
 }

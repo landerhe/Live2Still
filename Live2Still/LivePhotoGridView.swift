@@ -11,10 +11,12 @@ struct LivePhotoGridView: View {
     let store: LivePhotoLibraryStore
     @Binding var selectedIDs: Set<String>
     var isCachingEnabled: Bool = true
+    var onOpenInSwipe: (LivePhotoItem) -> Void
 
     @State private var previewItem: LivePhotoItem?
     @State private var cachedWindowAssets: [PHAsset] = []
     @State private var cachedWindowSize: CGSize = .zero
+    @State private var cachedWindowRange: Range<Int>?
 
     var body: some View {
         ScrollView {
@@ -26,7 +28,8 @@ struct LivePhotoGridView: View {
                         totalCount: store.livePhotoCount,
                         store: store,
                         isSelected: selectedIDs.contains(item.id),
-                        onTap: { toggleSelection(item.id) },
+                        onTap: { onOpenInSwipe(item) },
+                        onToggleSelection: { toggleSelection(item.id) },
                         onLongPress: { previewItem = item }
                     )
                     .onAppear {
@@ -79,6 +82,11 @@ struct LivePhotoGridView: View {
 
     private func updateCacheWindow(around visibleIndex: Int) {
         let radius = LivePhotoDesign.gridCacheWindowRadius
+        if let range = cachedWindowRange,
+           visibleIndex >= range.lowerBound + (range.lowerBound == 0 ? 0 : radius / 2),
+           visibleIndex < range.upperBound - radius / 2 {
+            return
+        }
         let lower = max(0, visibleIndex - radius)
         let upper = min(store.items.count, visibleIndex + radius + 1)
         guard lower < upper else { return }
@@ -97,6 +105,7 @@ struct LivePhotoGridView: View {
 
         cachedWindowAssets = assets
         cachedWindowSize = size
+        cachedWindowRange = lower ..< upper
         store.startCaching(assets: assets, targetSize: size)
     }
 
@@ -105,6 +114,7 @@ struct LivePhotoGridView: View {
         store.stopCaching(assets: cachedWindowAssets, targetSize: cachedWindowSize)
         cachedWindowAssets = []
         cachedWindowSize = .zero
+        cachedWindowRange = nil
     }
 }
 
@@ -115,6 +125,7 @@ private struct LivePhotoGridCell: View {
     let store: LivePhotoLibraryStore
     let isSelected: Bool
     let onTap: () -> Void
+    let onToggleSelection: () -> Void
     let onLongPress: () -> Void
 
     @State private var thumbnailState: ThumbnailDisplayState = .loading
@@ -127,20 +138,37 @@ private struct LivePhotoGridCell: View {
     }
 
     var body: some View {
-        LivePhotoSelectionCell(
-            thumbnailState: thumbnailState,
-            badgeSystemImage: nil,
-            isSelected: isSelected,
-            accessibilityLabelText: LivePhotoAccessibility.gridLabel(
-                for: item.asset,
-                index: itemIndex,
-                total: totalCount,
-                isSelected: isSelected
-            ),
-            accessibilityHintText: "Double tap to select. Long press to preview.",
-            onTap: onTap,
-            onRetry: thumbnailState.isFailed ? { Task { await loadThumbnail(forceLoading: true) } } : nil
-        )
+        ZStack(alignment: .topTrailing) {
+            LivePhotoSelectionCell(
+                thumbnailState: thumbnailState,
+                badgeSystemImage: nil,
+                isSelected: isSelected,
+                showsSelectionControl: false,
+                accessibilityLabelText: LivePhotoAccessibility.gridLabel(
+                    for: item.asset,
+                    index: itemIndex,
+                    total: totalCount,
+                    isSelected: isSelected
+                ),
+                accessibilityHintText: "Double tap to start swiping from this photo. Long press to preview.",
+                onTap: {
+                    store.rememberPreview(thumbnailState.image, for: item.asset)
+                    onTap()
+                },
+                onRetry: thumbnailState.isFailed ? { Task { await loadThumbnail(forceLoading: true) } } : nil
+            )
+
+            Button(action: onToggleSelection) {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.body.weight(.semibold))
+                    .symbolRenderingMode(.palette)
+                    .foregroundStyle(.white, isSelected ? Color.accentColor : Color.white)
+                    .background(.black.opacity(0.55), in: Circle())
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isSelected ? "Deselect photo" : "Select photo")
+        }
         .simultaneousGesture(
             LongPressGesture(minimumDuration: 0.35).onEnded { _ in
                 onLongPress()
@@ -161,12 +189,13 @@ private struct LivePhotoGridCell: View {
             thumbnailState = .loading
         }
 
-        let result = await store.requestThumbnail(
+        let events = store.imageEvents(
             for: item.asset,
             targetSize: targetSize
         )
-
-        guard !Task.isCancelled, token == loadToken else { return }
-        thumbnailState = result.displayState
+        for await event in events {
+            guard !Task.isCancelled, token == loadToken else { return }
+            thumbnailState = thumbnailState.applying(event)
+        }
     }
 }

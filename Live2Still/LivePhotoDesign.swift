@@ -15,8 +15,7 @@ enum LivePhotoDesign {
     static let toastAutoDismissSeconds: TimeInterval = 5
     static let reviewDeckMaxCount = 500
     static let reviewCardThumbnailMaxEdge: CGFloat = 1024
-    static let backCardThumbnailMaxEdge: CGFloat = 720
-    static let thumbnailFallbackTimeoutSeconds: TimeInterval = 2.5
+    static let backCardThumbnailMaxEdge: CGFloat = 480
 
     static var gridColumns: [GridItem] {
         [
@@ -39,9 +38,10 @@ enum LivePhotoDesign {
     static let launchVerticalSpacing: CGFloat = 20
     static let launchIconSize: CGFloat = 56
     static let welcomeOnboardingKey = "hasCompletedWelcomeOnboarding"
-    static let showLocalLibraryOnlyKey = "showLocalLibraryOnly"
+    static let showCloudPhotosKey = "showCloudPhotos"
+    static let analyzeCloudPhotosKey = "analyzeCloudPhotos"
     static let removeOriginalKey = "removeOriginalLivePhoto"
-    static let gridCacheWindowRadius = 40
+    static let gridCacheWindowRadius = 16
     static let albumConvertBatchCap = 100
     static let swipeOverlayRevealProgress: Double = 0.15
 }

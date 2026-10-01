@@ -5,14 +5,10 @@
 
 import UIKit
 
-enum ThumbnailRequestResult: Sendable {
-    case success(UIImage)
-    case failed
-}
-
 enum ThumbnailDisplayState {
     case loading
     case loaded(UIImage)
+    case unavailable
     case failed
 
     var image: UIImage? {
@@ -24,15 +20,33 @@ enum ThumbnailDisplayState {
         if case .failed = self { return true }
         return false
     }
+
+    var isUnavailable: Bool {
+        if case .unavailable = self { return true }
+        return false
+    }
+
+    func applying(_ event: ThumbnailImageEvent) -> ThumbnailDisplayState {
+        switch event {
+        case .image(let image, _): return .loaded(image)
+        case .failed: return image == nil ? .failed : self
+        case .unavailable: return image == nil ? .unavailable : self
+        }
+    }
 }
 
-extension ThumbnailRequestResult {
+enum ThumbnailImageEvent: Sendable {
+    case image(UIImage, isFinal: Bool)
+    case unavailable
+    case failed
+}
+
+extension ThumbnailImageEvent {
     var displayState: ThumbnailDisplayState {
         switch self {
-        case .success(let image):
-            .loaded(image)
-        case .failed:
-            .failed
+        case .image(let image, _): .loaded(image)
+        case .unavailable: .unavailable
+        case .failed: .failed
         }
     }
 }

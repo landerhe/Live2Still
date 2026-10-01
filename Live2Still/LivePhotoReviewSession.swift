@@ -11,6 +11,43 @@ enum LivePhotoReviewAction: Equatable {
     case keep(String)
 }
 
+enum LivePhotoReviewOrder: String, CaseIterable, Identifiable {
+    case newestFirst
+    case oldestFirst
+    case random
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .newestFirst: "Newest First"
+        case .oldestFirst: "Oldest First"
+        case .random: "Random"
+        }
+    }
+}
+
+struct BatchActionSummary {
+    let requested: Set<String>
+    let missing: Set<String>
+    let attention: Set<String>
+
+    var completedCount: Int {
+        requested.subtracting(missing).subtracting(attention).count
+    }
+
+    var message: String {
+        var value = "Completed \(completedCount) of \(requested.count) changes."
+        if !missing.isEmpty {
+            value += " \(missing.count) photo\(missing.count == 1 ? " was" : "s were") no longer in your library."
+        }
+        if !attention.isEmpty {
+            value += " \(attention.count) still need attention. Select Apply to retry."
+        }
+        return value
+    }
+}
+
 @MainActor
 @Observable
 final class LivePhotoReviewSession {
@@ -25,7 +62,9 @@ final class LivePhotoReviewSession {
     /// Ordered membership of the delete queue (cells stay until removed).
     private(set) var deleteQueueOrder: [String] = []
     private(set) var keptCount: Int = 0
-    private(set) var lastAction: LivePhotoReviewAction?
+    private(set) var actionHistory: [LivePhotoReviewAction] = []
+
+    var lastAction: LivePhotoReviewAction? { actionHistory.last }
 
     var hasQueuedActions: Bool {
         !convertQueueOrder.isEmpty || !deleteQueueOrder.isEmpty
@@ -40,7 +79,7 @@ final class LivePhotoReviewSession {
     }
 
     var canUndo: Bool {
-        lastAction != nil && index > 0
+        !actionHistory.isEmpty && index > 0
     }
 
     func queuedItemsForConvert(from items: [LivePhotoItem]) -> [LivePhotoItem] {
@@ -88,7 +127,7 @@ final class LivePhotoReviewSession {
         }
         deck = newDeck
         index = 0
-        lastAction = nil
+        actionHistory = []
     }
 
     /// Starts or restarts when the deck was emptied (e.g. after library sync).
@@ -105,14 +144,25 @@ final class LivePhotoReviewSession {
         deleteQueue = []
         deleteQueueOrder = []
         keptCount = 0
-        lastAction = nil
+        actionHistory = []
     }
 
     /// Starts a fresh deck while preserving queued still/delete work.
     func startNewDeckPreservingQueue(deck newDeck: [LivePhotoItem]) {
         deck = newDeck
         index = 0
-        lastAction = nil
+        actionHistory = []
+    }
+
+    func appendDiscoveredItems(_ items: [LivePhotoItem], maxCount: Int) {
+        guard let lastID = deck.last?.id, deck.count < maxCount,
+              let lastIndex = items.firstIndex(where: { $0.id == lastID }) else { return }
+        var knownIDs = Set(deck.map(\.id))
+        for item in items.dropFirst(lastIndex + 1) where deck.count < maxCount {
+            if knownIDs.insert(item.id).inserted {
+                deck.append(item)
+            }
+        }
     }
 
     func recordConvert() {
@@ -122,7 +172,7 @@ final class LivePhotoReviewSession {
             convertQueueOrder.append(item.id)
         }
         convertQueue.insert(item.id)
-        lastAction = .convert(item.id)
+        actionHistory.append(.convert(item.id))
         index += 1
     }
 
@@ -133,21 +183,21 @@ final class LivePhotoReviewSession {
             deleteQueueOrder.append(item.id)
         }
         deleteQueue.insert(item.id)
-        lastAction = .delete(item.id)
+        actionHistory.append(.delete(item.id))
         index += 1
     }
 
     func recordKeep() {
         guard let item = currentItem else { return }
         keptCount += 1
-        lastAction = .keep(item.id)
+        actionHistory.append(.keep(item.id))
         index += 1
     }
 
     /// One-step undo of the last swipe/button action.
     @discardableResult
     func undoLastAction() -> Bool {
-        guard let action = lastAction, index > 0 else { return false }
+        guard let action = actionHistory.popLast(), index > 0 else { return false }
 
         index -= 1
         switch action {
@@ -160,7 +210,6 @@ final class LivePhotoReviewSession {
         case .keep:
             keptCount = max(0, keptCount - 1)
         }
-        lastAction = nil
         return true
     }
 
@@ -276,12 +325,10 @@ final class LivePhotoReviewSession {
 
         index = min(max(0, previousIndex - removedBeforeIndex), deck.count)
 
-        if let lastAction {
-            switch lastAction {
+        actionHistory = actionHistory.filter { action in
+            switch action {
             case .convert(let id), .delete(let id), .keep(let id):
-                if !validIDs.contains(id) {
-                    self.lastAction = nil
-                }
+                validIDs.contains(id)
             }
         }
     }

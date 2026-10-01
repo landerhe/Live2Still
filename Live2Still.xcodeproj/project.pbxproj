@@ -8,12 +8,18 @@
 
 /* Begin PBXFileReference section */
 		3D5C8B062FBE6CAF00B5B48E /* Live2Still.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Live2Still.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		AA0000000000000000000001 /* Live2StillTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = Live2StillTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		3D5C8B082FBE6CAF00B5B48E /* Live2Still */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = Live2Still;
+			sourceTree = "<group>";
+		};
+		AA0000000000000000000002 /* Live2StillTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Live2StillTests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -26,6 +32,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AA0000000000000000000003 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -33,6 +40,7 @@
 			isa = PBXGroup;
 			children = (
 				3D5C8B082FBE6CAF00B5B48E /* Live2Still */,
+				AA0000000000000000000002 /* Live2StillTests */,
 				3D5C8B072FBE6CAF00B5B48E /* Products */,
 			);
 			sourceTree = "<group>";
@@ -41,6 +49,7 @@
 			isa = PBXGroup;
 			children = (
 				3D5C8B062FBE6CAF00B5B48E /* Live2Still.app */,
+				AA0000000000000000000001 /* Live2StillTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -70,6 +79,19 @@
 			productReference = 3D5C8B062FBE6CAF00B5B48E /* Live2Still.app */;
 			productType = "com.apple.product-type.application";
 		};
+		AA0000000000000000000004 /* Live2StillTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = AA0000000000000000000008 /* Build configuration list for PBXNativeTarget "Live2StillTests" */;
+			buildPhases = (AA0000000000000000000005 /* Sources */, AA0000000000000000000003 /* Frameworks */);
+			buildRules = ();
+			dependencies = (AA0000000000000000000006 /* PBXTargetDependency */);
+			fileSystemSynchronizedGroups = (AA0000000000000000000002 /* Live2StillTests */);
+			name = Live2StillTests;
+			packageProductDependencies = ();
+			productName = Live2StillTests;
+			productReference = AA0000000000000000000001 /* Live2StillTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -83,6 +105,7 @@
 					3D5C8B052FBE6CAF00B5B48E = {
 						CreatedOnToolsVersion = 26.5;
 					};
+					AA0000000000000000000004 = { CreatedOnToolsVersion = 26.5; TestTargetID = 3D5C8B052FBE6CAF00B5B48E; };
 				};
 			};
 			buildConfigurationList = 3D5C8B012FBE6CAF00B5B48E /* Build configuration list for PBXProject "Live2Still" */;
@@ -100,6 +123,7 @@
 			projectRoot = "";
 			targets = (
 				3D5C8B052FBE6CAF00B5B48E /* Live2Still */,
+				AA0000000000000000000004 /* Live2StillTests */,
 			);
 		};
 /* End PBXProject section */
@@ -122,7 +146,16 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AA0000000000000000000005 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXContainerItemProxy section */
+		AA0000000000000000000007 /* PBXContainerItemProxy */ = {isa = PBXContainerItemProxy; containerPortal = 3D5C8AFE2FBE6CAF00B5B48E /* Project object */; proxyType = 1; remoteGlobalIDString = 3D5C8B052FBE6CAF00B5B48E; remoteInfo = Live2Still; };
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXTargetDependency section */
+		AA0000000000000000000006 /* PBXTargetDependency */ = {isa = PBXTargetDependency; target = 3D5C8B052FBE6CAF00B5B48E /* Live2Still */; targetProxy = AA0000000000000000000007 /* PBXContainerItemProxy */; };
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		3D5C8B0F2FBE6CB100B5B48E /* Debug */ = {
@@ -322,6 +355,8 @@
 			};
 			name = Release;
 		};
+		AA0000000000000000000009 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 26.0; PRODUCT_BUNDLE_IDENTIFIER = hvg.Live2StillTests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = 1; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Live2Still.app/Live2Still"; }; name = Debug; };
+		AA000000000000000000000A /* Release */ = {isa = XCBuildConfiguration; buildSettings = { BUNDLE_LOADER = "$(TEST_HOST)"; CODE_SIGN_STYLE = Automatic; GENERATE_INFOPLIST_FILE = YES; IPHONEOS_DEPLOYMENT_TARGET = 26.0; PRODUCT_BUNDLE_IDENTIFIER = hvg.Live2StillTests; PRODUCT_NAME = "$(TARGET_NAME)"; SDKROOT = iphoneos; SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor; SWIFT_VERSION = 5.0; TARGETED_DEVICE_FAMILY = 1; TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Live2Still.app/Live2Still"; }; name = Release; };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -343,6 +378,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		AA0000000000000000000008 /* Build configuration list for PBXNativeTarget "Live2StillTests" */ = {isa = XCConfigurationList; buildConfigurations = (AA0000000000000000000009 /* Debug */, AA000000000000000000000A /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
 /* End XCConfigurationList section */
 	};
 	rootObject = 3D5C8AFE2FBE6CAF00B5B48E /* Project object */;

@@ -10,8 +10,8 @@ import UIKit
 struct LivePhotoReviewView: View {
     let store: LivePhotoLibraryStore
     @Bindable var session: LivePhotoReviewSession
+    let reviewOrder: LivePhotoReviewOrder
     let onStartIfNeeded: () -> Void
-    let onSyncWithLibrary: () -> Void
     @Binding var showQueuedReview: Bool
     var isQueueProcessing: Bool = false
     var onApplyQueuedActions: (() -> Void)?
@@ -37,10 +37,6 @@ struct LivePhotoReviewView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
             onStartIfNeeded()
-            onSyncWithLibrary()
-        }
-        .onChange(of: store.items.count) { _, _ in
-            onSyncWithLibrary()
         }
     }
 
@@ -88,7 +84,7 @@ struct LivePhotoReviewView: View {
                     } label: {
                         Image(systemName: "arrow.uturn.backward")
                     }
-                    .accessibilityLabel("Undo last swipe")
+                    .accessibilityLabel("Previous photo")
                     .disabled(isQueueProcessing)
                 }
 
@@ -285,7 +281,10 @@ struct LivePhotoReviewView: View {
             }
             Button("Swipe Again") {
                 session.startNewDeckPreservingQueue(
-                    deck: store.makeReviewDeck(maxCount: LivePhotoDesign.reviewDeckMaxCount)
+                    deck: store.makeReviewDeck(
+                        maxCount: LivePhotoDesign.reviewDeckMaxCount,
+                        order: reviewOrder
+                    )
                 )
             }
             .buttonStyle(.glass)
@@ -683,6 +682,11 @@ struct LivePhotoCardImage: View {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
+            case .unavailable:
+                Image(systemName: "icloud.slash")
+                    .font(.largeTitle)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Photo is not on this device")
             case .failed:
                 VStack(spacing: 8) {
                     Image(systemName: "photo.badge.exclamationmark")
@@ -698,7 +702,7 @@ struct LivePhotoCardImage: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task(id: "\(item.id)-\(quality)") {
+        .task(id: "\(item.id)-\(quality)-\(Int(targetSize.width))x\(Int(targetSize.height))") {
             await loadThumbnail()
         }
     }
@@ -710,13 +714,14 @@ struct LivePhotoCardImage: View {
             thumbnailState = .loading
         }
 
-        let result = await store.requestThumbnail(
+        let events = store.imageEvents(
             for: item.asset,
             targetSize: targetSize,
             contentMode: .aspectFit
         )
-
-        guard !Task.isCancelled, token == loadToken else { return }
-        thumbnailState = result.displayState
+        for await event in events {
+            guard !Task.isCancelled, token == loadToken else { return }
+            thumbnailState = thumbnailState.applying(event)
+        }
     }
 }

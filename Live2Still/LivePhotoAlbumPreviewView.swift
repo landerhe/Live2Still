@@ -16,6 +16,7 @@ struct LivePhotoAlbumPreviewView: View {
     @State private var isPressingLive = false
     @State private var livePhoto: PHLivePhoto?
     @State private var isLoadingLivePhoto = false
+    @State private var livePhotoUnavailable = false
 
     var body: some View {
         NavigationStack {
@@ -47,8 +48,13 @@ struct LivePhotoAlbumPreviewView: View {
                             .padding(16)
                             .allowsHitTesting(false)
                         } else {
-                            ProgressView()
-                                .tint(.white)
+                            if livePhotoUnavailable {
+                                Text("Motion unavailable")
+                                    .font(.caption)
+                                    .foregroundStyle(.white)
+                            } else {
+                                ProgressView().tint(.white)
+                            }
                         }
                     }
                 }
@@ -86,6 +92,7 @@ struct LivePhotoAlbumPreviewView: View {
     private func loadLivePhotoIfNeeded(container: CGSize) async {
         guard livePhoto == nil, !isLoadingLivePhoto else { return }
         isLoadingLivePhoto = true
+        livePhotoUnavailable = false
         defer { isLoadingLivePhoto = false }
 
         let targetSize = LivePhotoThumbnailSizing.targetSize(
@@ -97,5 +104,6 @@ struct LivePhotoAlbumPreviewView: View {
             targetSize: targetSize,
             contentMode: .aspectFit
         )
+        livePhotoUnavailable = livePhoto == nil
     }
 }

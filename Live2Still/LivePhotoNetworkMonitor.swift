@@ -9,24 +9,21 @@ import Network
 final class LivePhotoNetworkMonitor {
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "com.live2still.network-monitor")
-    private let onChange: (Bool) -> Void
+    private let onChange: @MainActor @Sendable (Bool) -> Void
 
     private(set) var isConnected = true
 
-    init(onChange: @escaping (Bool) -> Void) {
+    init(onChange: @escaping @MainActor @Sendable (Bool) -> Void) {
         self.onChange = onChange
     }
 
     func start() {
-        monitor.pathUpdateHandler = { [weak self] path in
+        // Capture the Sendable callback, not this MainActor-isolated monitor.
+        let changeHandler = onChange
+        monitor.pathUpdateHandler = { path in
             let connected = path.status == .satisfied
             Task { @MainActor in
-                guard let self else { return }
-                let changed = self.isConnected != connected
-                self.isConnected = connected
-                if changed {
-                    self.onChange(connected)
-                }
+                changeHandler(connected)
             }
         }
         monitor.start(queue: queue)

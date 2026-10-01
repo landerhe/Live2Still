@@ -10,6 +10,7 @@ struct LivePhotoSelectionCell: View {
     let thumbnailState: ThumbnailDisplayState
     let badgeSystemImage: String?
     let isSelected: Bool
+    var showsSelectionControl: Bool = true
     let accessibilityLabelText: String
     var accessibilityHintText: String?
     let onTap: () -> Void
@@ -18,20 +19,36 @@ struct LivePhotoSelectionCell: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        Button(action: onRetry ?? onTap) {
-            GeometryReader { geometry in
-                ZStack {
-                    thumbnailLayer(size: geometry.size)
-                    selectionOverlay
-                    cornerBadge
+        ZStack(alignment: .bottomTrailing) {
+            Button(action: onTap) {
+                GeometryReader { geometry in
+                    ZStack {
+                        thumbnailLayer(size: geometry.size)
+                        if showsSelectionControl {
+                            selectionOverlay
+                        }
+                        cornerBadge
+                    }
                 }
+                .aspectRatio(1, contentMode: .fit)
             }
-            .aspectRatio(1, contentMode: .fit)
+            .buttonStyle(.plain)
+            .accessibilityLabel(accessibilityLabelText)
+            .accessibilityHint(accessibilityHintText ?? "")
+            .accessibilityAddTraits(isSelected ? .isSelected : [])
+
+            if thumbnailState.isFailed, let onRetry {
+                Button(action: onRetry) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 44, height: 44)
+                        .background(.black.opacity(0.65), in: Circle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Retry thumbnail")
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel(accessibilityLabelText)
-        .accessibilityHint(accessibilityHintText ?? "")
-        .accessibilityAddTraits(isSelected ? .isSelected : [])
         .livePhotoSelectionFeedback(trigger: isSelected)
     }
 
@@ -47,6 +64,14 @@ struct LivePhotoSelectionCell: View {
                 .scaledToFill()
                 .frame(width: size.width, height: size.height)
                 .clipped()
+        case .unavailable:
+            Color(.secondarySystemBackground)
+                .overlay {
+                    Image(systemName: "icloud.slash")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                }
+                .accessibilityLabel("Photo is not on this device")
         case .failed:
             Color(.secondarySystemBackground)
                 .overlay {
@@ -54,10 +79,6 @@ struct LivePhotoSelectionCell: View {
                         Image(systemName: "photo.badge.exclamationmark")
                             .font(.title3)
                             .foregroundStyle(.secondary)
-                        if onRetry != nil {
-                            Text("Tap to retry")
-                                .font(.caption2.weight(.medium))
-                        }
                     }
                 }
                 .accessibilityLabel("Thumbnail failed to load")

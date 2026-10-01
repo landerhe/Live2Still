@@ -84,6 +84,7 @@ struct LivePhotoSwipeCardContent: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var livePhoto: PHLivePhoto?
     @State private var isLoadingLivePhoto = false
+    @State private var livePhotoUnavailable = false
 
     private var targetSize: CGSize {
         LivePhotoThumbnailSizing.targetSize(
@@ -126,7 +127,15 @@ struct LivePhotoSwipeCardContent: View {
                 } else {
                     cardShape
                         .fill(Color.black.opacity(0.15))
-                        .overlay { ProgressView().tint(.white) }
+                        .overlay {
+                            if livePhotoUnavailable {
+                                Text("Motion unavailable")
+                                    .font(.caption)
+                                    .foregroundStyle(.white)
+                            } else {
+                                ProgressView().tint(.white)
+                            }
+                        }
                         .allowsHitTesting(false)
                 }
             }
@@ -157,11 +166,13 @@ struct LivePhotoSwipeCardContent: View {
                 isPressingLive = false
                 livePhoto = nil
                 isLoadingLivePhoto = false
+                livePhotoUnavailable = false
             }
         }
         .onChange(of: item.id) { _, _ in
             livePhoto = nil
             isLoadingLivePhoto = false
+            livePhotoUnavailable = false
             isPressingLive = false
         }
     }
@@ -169,12 +180,14 @@ struct LivePhotoSwipeCardContent: View {
     private func loadLivePhotoIfNeeded() async {
         guard isTop, livePhoto == nil, !isLoadingLivePhoto else { return }
         isLoadingLivePhoto = true
+        livePhotoUnavailable = false
         defer { isLoadingLivePhoto = false }
         livePhoto = await store.requestLivePhoto(
             for: item.asset,
             targetSize: targetSize,
             contentMode: .aspectFit
         )
+        livePhotoUnavailable = livePhoto == nil
     }
 }
 

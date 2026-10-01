@@ -17,6 +17,7 @@ enum LivePhotoError: LocalizedError {
     case conversionFailed(underlying: Error?)
     case batchPartialFailure(succeeded: Int, failed: Int)
     case alreadyConverting
+    case savedStillNotVerifiable
 
     var errorDescription: String? {
         switch self {
@@ -34,6 +35,8 @@ enum LivePhotoError: LocalizedError {
             "Converted \(succeeded) photo\(succeeded == 1 ? "" : "s"). \(failed) failed."
         case .alreadyConverting:
             "A conversion is already in progress."
+        case .savedStillNotVerifiable:
+            "A still was previously saved, but Photos cannot verify it. Keep the original and review this photo in Photos."
         }
     }
 }
@@ -43,6 +46,8 @@ struct BatchConversionResult: Sendable {
     let failed: Int
     let errors: [Error]
     let convertedSourceIDs: [String]
+    let originalsRemovedSourceIDs: [String]
+    let retainedSourceIDs: [String]
     /// Source IDs that failed during prepare (safe to retry).
     let failedSourceIDs: [String]
     /// True when stills were created but the user canceled (or delete failed) removing originals.
@@ -89,6 +94,8 @@ final class LivePhotoConverter {
                 failed: 0,
                 errors: [],
                 convertedSourceIDs: [],
+                originalsRemovedSourceIDs: [],
+                retainedSourceIDs: [],
                 failedSourceIDs: [],
                 originalsRemovalCanceled: false,
                 bytesSaved: nil,
@@ -97,6 +104,19 @@ final class LivePhotoConverter {
         }
 
         let totalPhotos = max(assets.count, 1)
+        let ledger = UserDefaults.standard.dictionary(forKey: "createdStillBySource") as? [String: String] ?? [:]
+        let trackedAssets = assets.filter { ledger[$0.localIdentifier] != nil }
+        let createdIDs = trackedAssets.compactMap { ledger[$0.localIdentifier] }.filter { !$0.isEmpty }
+        let createdFetch = PHAsset.fetchAssets(withLocalIdentifiers: createdIDs, options: nil)
+        var verifiedStillIDs: Set<String> = []
+        createdFetch.enumerateObjects { asset, _, _ in verifiedStillIDs.insert(asset.localIdentifier) }
+        let alreadyConverted = trackedAssets.filter {
+            guard let createdID = ledger[$0.localIdentifier] else { return false }
+            return verifiedStillIDs.contains(createdID)
+        }
+        let unverifiedSourceIDs = trackedAssets.map(\.localIdentifier)
+            .filter { id in !alreadyConverted.contains(where: { $0.localIdentifier == id }) }
+        let newAssets = assets.filter { ledger[$0.localIdentifier] == nil }
 
         isConverting = true
         isSaving = false
@@ -109,47 +129,70 @@ final class LivePhotoConverter {
             endBackgroundTaskIfNeeded()
         }
 
-        let prepareOutcome = await prepareAssets(assets, totalPhotos: totalPhotos, progress: progress)
+        let prepareOutcome = await prepareAssets(newAssets, totalPhotos: totalPhotos, progress: progress)
         let prepared = prepareOutcome.prepared
-        let prepareFailed = prepareOutcome.failed
-        let prepareErrors = prepareOutcome.errors
-        let failedSourceIDs = prepareOutcome.failedSourceIDs
+        let prepareFailed = prepareOutcome.failed + unverifiedSourceIDs.count
+        let prepareErrors = prepareOutcome.errors + unverifiedSourceIDs.map { _ in LivePhotoError.savedStillNotVerifiable }
+        let failedSourceIDs = prepareOutcome.failedSourceIDs + unverifiedSourceIDs
 
-        guard !prepared.isEmpty else {
+        guard !prepared.isEmpty || !alreadyConverted.isEmpty else {
             throw prepareErrors.first ?? LivePhotoError.conversionFailed(underlying: nil)
         }
 
         isSaving = true
         reportProgress(completed: totalPhotos, total: totalPhotos, callback: progress)
 
-        let committed: [PreparedConversion]
-        do {
-            // Transaction 1: create stills only (survives if the user later cancels delete).
-            committed = try await commitCreations(prepared: prepared)
-            // Best-effort metadata; stills already exist if this fails.
-            try? await applyBatchPostCreationMetadata(prepared: committed)
-            reportProgress(completed: totalPhotos, total: totalPhotos, callback: progress)
-        } catch {
-            cleanupTemporaryFiles(prepared)
-            throw LivePhotoError.conversionFailed(underlying: error)
+        var committed: [PreparedConversion] = []
+        if !prepared.isEmpty {
+            do {
+                committed = try await commitCreations(prepared: prepared)
+                var updatedLedger = ledger
+                for item in committed {
+                    updatedLedger[item.sourceAsset.localIdentifier] = item.placeholderLocalIdentifier ?? ""
+                }
+                UserDefaults.standard.set(updatedLedger, forKey: "createdStillBySource")
+                try? await applyBatchPostCreationMetadata(prepared: committed)
+                reportProgress(completed: totalPhotos, total: totalPhotos, callback: progress)
+            } catch {
+                cleanupTemporaryFiles(prepared)
+                throw LivePhotoError.conversionFailed(underlying: error)
+            }
         }
 
         var originalsRemovalCanceled = false
-        var didRemoveOriginals = false
+        var removedIDs: Set<String> = []
+        let verifiedCreatedIDs = await Self.confirmedCreatedIDs(
+            Set(committed.compactMap(\.placeholderLocalIdentifier))
+        )
+        let convertedAssets = committed.filter {
+            guard let id = $0.placeholderLocalIdentifier else { return false }
+            return verifiedCreatedIDs.contains(id)
+        }
+            .map(\.sourceAsset) + alreadyConverted
 
         if removeOriginal {
-            do {
-                // Transaction 2: delete originals only after stills exist.
-                try await deleteOriginals(prepared: committed)
-                didRemoveOriginals = true
-            } catch {
+            if convertedAssets.isEmpty {
                 originalsRemovalCanceled = true
+            } else {
+                do {
+                    // Transaction 2: delete originals only after stills are verified.
+                    try await deleteOriginals(assets: convertedAssets)
+                    removedIDs = await Self.confirmedRemovedIDs(Set(convertedAssets.map(\.localIdentifier)))
+                    originalsRemovalCanceled = removedIDs.count != committed.count + alreadyConverted.count
+                    var updatedLedger = UserDefaults.standard.dictionary(forKey: "createdStillBySource") as? [String: String] ?? [:]
+                    for id in removedIDs {
+                        updatedLedger.removeValue(forKey: id)
+                    }
+                    UserDefaults.standard.set(updatedLedger, forKey: "createdStillBySource")
+                } catch {
+                    originalsRemovalCanceled = true
+                }
             }
         }
 
         cleanupTemporaryFiles(prepared)
 
-        let succeeded = committed.count
+        let succeeded = committed.count + alreadyConverted.count
         let failed = prepareFailed
 
         if failed > 0, succeeded == 0 {
@@ -158,9 +201,12 @@ final class LivePhotoConverter {
 
         let bytesSaved: Int64?
         let bytesSavedIsEstimate: Bool
-        if didRemoveOriginals {
-            bytesSaved = committed.reduce(0) { $0 + $1.savedBytes }
-            bytesSavedIsEstimate = committed.contains(where: \.savedBytesIsEstimate)
+        if !removedIDs.isEmpty {
+            bytesSaved = committed.filter { removedIDs.contains($0.sourceAsset.localIdentifier) }
+                .reduce(0) { $0 + $1.savedBytes }
+            bytesSavedIsEstimate = committed.contains {
+                removedIDs.contains($0.sourceAsset.localIdentifier) && $0.savedBytesIsEstimate
+            }
         } else {
             bytesSaved = nil
             bytesSavedIsEstimate = false
@@ -170,7 +216,10 @@ final class LivePhotoConverter {
             succeeded: succeeded,
             failed: failed,
             errors: prepareErrors,
-            convertedSourceIDs: committed.map(\.sourceAsset.localIdentifier),
+            convertedSourceIDs: committed.map(\.sourceAsset.localIdentifier) + alreadyConverted.map(\.localIdentifier),
+            originalsRemovedSourceIDs: Array(removedIDs),
+            retainedSourceIDs: (committed.map(\.sourceAsset) + alreadyConverted)
+                .map(\.localIdentifier).filter { !removedIDs.contains($0) },
             failedSourceIDs: failedSourceIDs,
             originalsRemovalCanceled: originalsRemovalCanceled,
             bytesSaved: bytesSaved,
@@ -328,11 +377,34 @@ final class LivePhotoConverter {
         }
     }
 
-    private func deleteOriginals(prepared: [PreparedConversion]) async throws {
-        let assetsToDelete = prepared.map(\.sourceAsset) as NSArray
+    private func deleteOriginals(assets: [PHAsset]) async throws {
+        let assetsToDelete = assets as NSArray
         try await PHPhotoLibrary.shared().performChanges {
             PHAssetChangeRequest.deleteAssets(assetsToDelete)
         }
+    }
+
+    private static func confirmedRemovedIDs(_ ids: Set<String>) async -> Set<String> {
+        for attempt in 0 ..< 4 {
+            let remaining = PHAsset.fetchAssets(withLocalIdentifiers: Array(ids), options: nil)
+            var present: Set<String> = []
+            remaining.enumerateObjects { asset, _, _ in present.insert(asset.localIdentifier) }
+            if present.isEmpty || attempt == 3 { return ids.subtracting(present) }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        return []
+    }
+
+    private static func confirmedCreatedIDs(_ ids: Set<String>) async -> Set<String> {
+        guard !ids.isEmpty else { return [] }
+        var found: Set<String> = []
+        for attempt in 0 ..< 4 {
+            let assets = PHAsset.fetchAssets(withLocalIdentifiers: Array(ids), options: nil)
+            assets.enumerateObjects { asset, _, _ in found.insert(asset.localIdentifier) }
+            if found.count == ids.count || attempt == 3 { break }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        return found
     }
 
     private func applyBatchPostCreationMetadata(prepared: [PreparedConversion]) async throws {
@@ -464,7 +536,8 @@ final class LivePhotoConverter {
 
     nonisolated private static func photoResource(from asset: PHAsset) throws -> PHAssetResource {
         let resources = PHAssetResource.assetResources(for: asset)
-        guard let photo = resources.first(where: { $0.type == .photo }) else {
+        guard let photo = resources.first(where: { $0.type == .photo })
+            ?? resources.first(where: { $0.type == .fullSizePhoto }) else {
             throw LivePhotoError.photoResourceMissing
         }
         return photo

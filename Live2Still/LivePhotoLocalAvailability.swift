@@ -13,8 +13,10 @@ struct LocalLibraryFilterProgress: Sendable {
 }
 
 enum LivePhotoLocalAvailability {
-    private static let cacheLock = NSLock()
-    private static var availabilityCache: [String: Bool] = [:]
+    // Explicitly opt this lock-protected cache out of the target's default MainActor isolation.
+    // Every cache access is serialized by cacheLock.
+    nonisolated private static let cacheLock = NSLock()
+    nonisolated(unsafe) private static var availabilityCache: [String: Bool] = [:]
 
     /// Clears cached availability results after library reloads or scope changes.
     nonisolated static func clearCache() {
@@ -54,8 +56,9 @@ enum LivePhotoLocalAvailability {
     /// Optional callbacks support progressive UI and status text during large libraries.
     nonisolated static func filterOfflineItems(
         from result: PHFetchResult<PHAsset>,
-        batchSize: Int = 250,
-        progressInterval: Int = 500,
+        oldestFirst: Bool = false,
+        batchSize: Int = 32,
+        progressInterval: Int = 64,
         onProgress: (@Sendable (LocalLibraryFilterProgress) -> Void)?,
         onBatch: (@Sendable ([LivePhotoItem]) -> Void)?
     ) -> [LivePhotoItem] {
@@ -70,8 +73,11 @@ enum LivePhotoLocalAvailability {
 
         var found = 0
 
-        result.enumerateObjects { asset, index, _ in
+        for offset in 0 ..< total {
+            if Task<Never, Never>.isCancelled { break }
             autoreleasepool {
+                let index = oldestFirst ? total - 1 - offset : offset
+                let asset = result.object(at: index)
                 guard isAssetAvailableOffline(asset) else { return }
 
                 let item = LivePhotoItem(id: asset.localIdentifier, asset: asset)
@@ -84,10 +90,14 @@ enum LivePhotoLocalAvailability {
                     pendingBatch.removeAll(keepingCapacity: true)
                 }
 
-                let scanned = index + 1
-                if scanned == total || scanned % progressInterval == 0 {
-                    onProgress?(LocalLibraryFilterProgress(scanned: scanned, total: total, found: found))
+            }
+            let scanned = offset + 1
+            if scanned == total || scanned % progressInterval == 0 {
+                if !pendingBatch.isEmpty {
+                    onBatch?(pendingBatch)
+                    pendingBatch.removeAll(keepingCapacity: true)
                 }
+                onProgress?(LocalLibraryFilterProgress(scanned: scanned, total: total, found: found))
             }
         }
 

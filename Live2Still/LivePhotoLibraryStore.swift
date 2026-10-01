@@ -24,20 +24,23 @@ struct LivePhotoItem: Identifiable, Hashable {
 @MainActor
 @Observable
 final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
-    nonisolated static let pageSize = 500
+    nonisolated static let pageSize = 120
 
     private(set) var items: [LivePhotoItem] = []
     private(set) var authorizationStatus: PHAuthorizationStatus = .notDetermined
+    private(set) var isPreparing = true
     private(set) var isLoading = false
     private(set) var loadingStatusMessage = ""
     private(set) var libraryRevision = 0
     private(set) var isNetworkConnected = true
     private(set) var isOfflineFiltering = false
     private(set) var showLocalLibraryOnly: Bool
+    private(set) var displayOrder: LivePhotoReviewOrder = .newestFirst
 
-    /// True when the UI should hide iCloud-only photos (offline or user preference).
+    /// True only when the user explicitly asks to hide iCloud-only photos.
+    /// A transient offline signal must not trigger an exhaustive launch-time scan.
     var showsLocalLibraryOnly: Bool {
-        !isNetworkConnected || showLocalLibraryOnly
+        showLocalLibraryOnly
     }
 
     var isOfflineMode: Bool {
@@ -67,11 +70,19 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
         return items.count >= fetchResult.count
     }
 
-    private var allowsPhotoLibraryNetworking: Bool {
-        isNetworkConnected && !showLocalLibraryOnly
-    }
-
     let imageManager = PHCachingImageManager()
+    private let thumbnailCache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 180
+        cache.totalCostLimit = 64 * 1_024 * 1_024
+        return cache
+    }()
+    private let previewCache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.countLimit = 48
+        cache.totalCostLimit = 24 * 1_024 * 1_024
+        return cache
+    }()
     private var fetchResult: PHFetchResult<PHAsset>?
     private var reloadTask: Task<Void, Never>?
     private var reloadGeneration = 0
@@ -85,9 +96,7 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
     private var cachedAllItemIDsRevision = -1
 
     override init() {
-        showLocalLibraryOnly = UserDefaults.standard.bool(
-            forKey: LivePhotoDesign.showLocalLibraryOnlyKey
-        )
+        showLocalLibraryOnly = !UserDefaults.standard.bool(forKey: LivePhotoDesign.showCloudPhotosKey)
         super.init()
     }
 
@@ -103,6 +112,7 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
         PHPhotoLibrary.shared().register(self)
         startNetworkMonitoring()
         applyAuthorizationStatus(status)
+        isPreparing = false
     }
 
     private func startNetworkMonitoring() {
@@ -118,30 +128,29 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
     private func handleNetworkStatusChange(isConnected: Bool) {
         guard isNetworkConnected != isConnected else { return }
         isNetworkConnected = isConnected
-
-        if showsLocalLibraryOnly {
-            if items.isEmpty {
-                applyLocalLibraryFilter(mode: .initial)
-            }
-            return
-        }
-
-        offlineFilterTask?.cancel()
-        isOfflineFiltering = false
-        loadingStatusMessage = ""
-        restoreOnlineLibraryView()
     }
 
     func setShowLocalLibraryOnly(_ enabled: Bool) {
         guard showLocalLibraryOnly != enabled else { return }
         showLocalLibraryOnly = enabled
-        UserDefaults.standard.set(enabled, forKey: LivePhotoDesign.showLocalLibraryOnlyKey)
+        UserDefaults.standard.set(!enabled, forKey: LivePhotoDesign.showCloudPhotosKey)
         if enabled {
             applyLocalLibraryFilter(mode: .initial)
         } else {
             offlineFilterTask?.cancel()
             isOfflineFiltering = false
             loadingStatusMessage = ""
+            restoreOnlineLibraryView()
+        }
+    }
+
+    func setDisplayOrder(_ order: LivePhotoReviewOrder) {
+        guard order != .random, displayOrder != order else { return }
+        displayOrder = order
+        if showLocalLibraryOnly {
+            items.reverse()
+            applyLocalLibraryFilter(mode: .refresh)
+        } else {
             restoreOnlineLibraryView()
         }
     }
@@ -155,6 +164,17 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
         try await PHPhotoLibrary.shared().performChanges {
             PHAssetChangeRequest.deleteAssets(assets as NSArray)
         }
+    }
+
+    func confirmedRemovedIDs(_ ids: Set<String>) async -> Set<String> {
+        for attempt in 0 ..< 4 {
+            let remaining = PHAsset.fetchAssets(withLocalIdentifiers: Array(ids), options: nil)
+            var present: Set<String> = []
+            remaining.enumerateObjects { asset, _, _ in present.insert(asset.localIdentifier) }
+            if present.isEmpty || attempt == 3 { return ids.subtracting(present) }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        return []
     }
 
     func requestAuthorization() async {
@@ -172,7 +192,7 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
         let hadAccess = hasLibraryAccess
         authorizationStatus = status
         if hasLibraryAccess {
-            if !hadAccess || items.isEmpty {
+            if !hadAccess || (fetchResult == nil && !isLoading && !isOfflineFiltering) {
                 reload()
             }
         } else {
@@ -186,11 +206,8 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
     func loadMoreItemsIfNeeded(visibleIndex: Int) {
         guard !showsLocalLibraryOnly else { return }
         guard let fetchResult, items.count < fetchResult.count else { return }
-        let targetCount = min(
-            fetchResult.count,
-            max(items.count, visibleIndex + Self.pageSize / 2)
-        )
-        guard targetCount > items.count else { return }
+        guard visibleIndex >= items.count - Self.pageSize / 3 else { return }
+        let targetCount = min(fetchResult.count, items.count + Self.pageSize)
         appendItems(from: fetchResult, start: items.count, end: targetCount)
     }
 
@@ -204,81 +221,103 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
             return
         }
 
-        let options = Self.livePhotoFetchOptions()
         if items.isEmpty {
-            scheduleInitialLoad(options: options)
+            scheduleInitialLoad()
         } else {
             scheduleItemsRebuild(showLoading: false) {
-                Self.fetchLivePhotoSnapshot(options: options)
+                Self.fetchLivePhotoSnapshot()
             }
         }
     }
 
-    func requestThumbnail(
+    func requestAnalysisThumbnail(for asset: PHAsset, targetSize: CGSize) async -> UIImage? {
+        var best: UIImage?
+        for await event in imageEvents(for: asset, targetSize: targetSize) {
+            guard !Task.isCancelled else { return nil }
+            switch event {
+            case .image(let image, let isFinal):
+                best = image
+                if isFinal { return image }
+            case .unavailable, .failed:
+                return best
+            }
+        }
+        return best
+    }
+
+    func imageEvents(
         for asset: PHAsset,
         targetSize: CGSize,
         contentMode: PHImageContentMode = .aspectFill
-    ) async -> ThumbnailRequestResult {
-        let context = ThumbnailRequestContext()
-
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { continuation in
-                context.resumeOnce = ContinuationResumeGuard(continuation: continuation)
-
-                context.fallbackTask = Task {
-                    try? await Task.sleep(
-                        for: .seconds(LivePhotoDesign.thumbnailFallbackTimeoutSeconds)
-                    )
-                    guard !Task.isCancelled else { return }
-                    if let fallback = context.bestDegraded() {
-                        context.complete(with: .success(fallback))
-                    } else {
-                        context.complete(with: .failed)
-                    }
-                }
-
-                let options = PHImageRequestOptions()
-                options.deliveryMode = .opportunistic
-                options.resizeMode = .fast
-                options.isNetworkAccessAllowed = allowsPhotoLibraryNetworking
-
-                context.requestID = imageManager.requestImage(
-                    for: asset,
-                    targetSize: targetSize,
-                    contentMode: contentMode,
-                    options: options
-                ) { image, info in
-                    if info?[PHImageCancelledKey] as? Bool == true {
-                        context.complete(with: .failed)
-                        return
-                    }
-                    if info?[PHImageErrorKey] != nil {
-                        context.complete(with: .failed)
-                        return
-                    }
-
-                    let isDegraded = info?[PHImageResultIsDegradedKey] as? Bool ?? false
-
-                    guard let image else {
-                        if !isDegraded {
-                            context.complete(with: .failed)
-                        }
-                        return
-                    }
-
-                    if isDegraded {
-                        context.storeDegraded(image)
-                        return
-                    }
-
-                    context.complete(with: .success(image))
-                }
-            }
-        } onCancel: {
-            Task { @MainActor in
-                context.cancel(using: imageManager)
+    ) -> AsyncStream<ThumbnailImageEvent> {
+        let cacheKey = thumbnailCacheKey(for: asset, targetSize: targetSize, contentMode: contentMode)
+        if let cached = thumbnailCache.object(forKey: cacheKey) {
+            return AsyncStream { continuation in
+                continuation.yield(.image(cached, isFinal: true))
+                continuation.finish()
             }
         }
+
+        let manager = imageManager
+        let localOnly = showLocalLibraryOnly
+        let previewKey = previewCacheKey(for: asset)
+        let preview = previewCache.object(forKey: previewKey)
+        return AsyncStream { continuation in
+            let context = ImageStreamRequestContext(continuation: continuation)
+            continuation.onTermination = { _ in context.cancel(using: manager) }
+            if let preview { context.send(image: preview, isFinal: false) }
+
+            let options = PHImageRequestOptions()
+            options.deliveryMode = .opportunistic
+            options.resizeMode = .fast
+            options.isNetworkAccessAllowed = !localOnly
+
+            let timeout = Task {
+                try? await Task.sleep(for: .seconds(localOnly ? 8 : 30))
+                guard !Task.isCancelled else { return }
+                context.timeout(using: manager)
+            }
+            context.setTimeoutTask(timeout)
+
+            let requestID = manager.requestImage(
+                for: asset,
+                targetSize: targetSize,
+                contentMode: contentMode,
+                options: options
+            ) { image, info in
+                if info?[PHImageCancelledKey] as? Bool == true {
+                    context.cancel(using: manager)
+                    return
+                }
+                if info?[PHImageErrorKey] != nil {
+                    context.finish(with: .failed)
+                    return
+                }
+
+                let degraded = info?[PHImageResultIsDegradedKey] as? Bool ?? false
+                if let image {
+                    context.send(image: image, isFinal: !degraded)
+                    Task { @MainActor in
+                        self.storePreview(image, forKey: previewKey)
+                        if !degraded { self.storeThumbnail(image, forKey: cacheKey) }
+                    }
+                } else if !degraded {
+                    let inCloud = info?[PHImageResultIsInCloudKey] as? Bool ?? false
+                    context.finish(with: inCloud ? .unavailable : .failed)
+                    if inCloud, localOnly {
+                        Task { @MainActor in self.removeUnavailableLocalAsset(asset.localIdentifier) }
+                    }
+                }
+            }
+            context.setRequestID(requestID, using: manager)
+        }
+    }
+
+    private func removeUnavailableLocalAsset(_ id: String) {
+        guard showLocalLibraryOnly else { return }
+        guard items.contains(where: { $0.id == id }) else { return }
+        items.removeAll { $0.id == id }
+        libraryRevision += 1
     }
 
     func requestLivePhoto(
@@ -292,29 +331,40 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
 
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                context.resumeOnce = ContinuationResumeGuard(continuation: continuation)
+                context.setContinuation(continuation)
+
+                let timeout = Task {
+                    try? await Task.sleep(for: .seconds(20))
+                    guard !Task.isCancelled else { return }
+                    context.cancel(using: imageManager)
+                }
+                context.setTimeoutTask(timeout)
 
                 let options = PHLivePhotoRequestOptions()
-                options.deliveryMode = .opportunistic
-                options.isNetworkAccessAllowed = allowsPhotoLibraryNetworking
+                options.deliveryMode = .highQualityFormat
+                options.isNetworkAccessAllowed = !showLocalLibraryOnly
 
-                context.requestID = imageManager.requestLivePhoto(
+                let requestID = imageManager.requestLivePhoto(
                     for: asset,
                     targetSize: targetSize,
                     contentMode: contentMode,
                     options: options
                 ) { livePhoto, info in
                     if info?[PHImageCancelledKey] as? Bool == true {
-                        context.resumeOnce?.resume(returning: nil)
+                        context.complete(with: nil)
                         return
                     }
                     if info?[PHImageErrorKey] != nil {
-                        context.resumeOnce?.resume(returning: nil)
+                        context.complete(with: nil)
                         return
                     }
-
-                    context.resumeOnce?.resume(returning: livePhoto)
+                    if let livePhoto {
+                        context.complete(with: livePhoto)
+                    } else if info?[PHImageResultIsDegradedKey] as? Bool != true {
+                        context.complete(with: nil)
+                    }
                 }
+                context.setRequestID(requestID, using: imageManager)
             }
         } onCancel: {
             Task { @MainActor in
@@ -351,6 +401,40 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
             contentMode: contentMode,
             options: options
         )
+    }
+
+    private func thumbnailCacheKey(
+        for asset: PHAsset,
+        targetSize: CGSize,
+        contentMode: PHImageContentMode
+    ) -> NSString {
+        let modified = Int(asset.modificationDate?.timeIntervalSince1970 ?? 0)
+        return "\(asset.localIdentifier)|\(modified)|\(Int(targetSize.width))x\(Int(targetSize.height))|\(contentMode.rawValue)" as NSString
+    }
+
+    private func previewCacheKey(for asset: PHAsset) -> NSString {
+        let modified = Int(asset.modificationDate?.timeIntervalSince1970 ?? 0)
+        return "\(asset.localIdentifier)|\(modified)" as NSString
+    }
+
+    func rememberPreview(_ image: UIImage?, for asset: PHAsset) {
+        guard let image else { return }
+        storePreview(image, forKey: previewCacheKey(for: asset))
+    }
+
+    private func storePreview(_ image: UIImage, forKey key: NSString) {
+        let cost = Int(image.size.width * image.scale * image.size.height * image.scale * 4)
+        if let cached = previewCache.object(forKey: key) {
+            let cachedCost = Int(cached.size.width * cached.scale * cached.size.height * cached.scale * 4)
+            if cachedCost >= cost { return }
+        }
+        previewCache.setObject(image, forKey: key, cost: cost)
+    }
+
+    private func storeThumbnail(_ image: UIImage, forKey key: NSString) {
+        let pixelWidth = Int(image.size.width * image.scale)
+        let pixelHeight = Int(image.size.height * image.scale)
+        thumbnailCache.setObject(image, forKey: key, cost: pixelWidth * pixelHeight * 4)
     }
 
     nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
@@ -404,11 +488,14 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
     private func applyIncrementalChanges(_ details: PHFetchResultChangeDetails<PHAsset>) {
         fetchResult = details.fetchResultAfterChanges
 
+        if showsLocalLibraryOnly {
+            let removedIDs = Set(details.removedObjects.map(\.localIdentifier))
+            if !removedIDs.isEmpty { items.removeAll { removedIDs.contains($0.id) } }
+            applyLocalLibraryFilter(mode: .refresh)
+            return
+        }
+
         if let indexes = details.insertedIndexes, !indexes.isEmpty {
-            if showsLocalLibraryOnly {
-                applyIncrementalLocalInserts(details)
-                return
-            }
             let updatedResult = details.fetchResultAfterChanges
             scheduleItemsRebuild(showLoading: false) {
                 Self.buildItems(from: updatedResult)
@@ -437,51 +524,10 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
 
         items = updated
 
-        if showsLocalLibraryOnly, !changed.isEmpty {
-            syncLocalItemsAfterIncrementalChanges(changed: changed)
-        } else {
-            libraryRevision += 1
-        }
-    }
-
-    private func syncLocalItemsAfterIncrementalChanges(changed: [PHAsset]) {
-        for asset in changed {
-            let id = asset.localIdentifier
-            if LivePhotoLocalAvailability.isAssetAvailableOffline(asset) {
-                let item = LivePhotoItem(id: id, asset: asset)
-                if let index = items.firstIndex(where: { $0.id == id }) {
-                    items[index] = item
-                } else {
-                    items.append(item)
-                }
-            } else {
-                items.removeAll { $0.id == id }
-            }
-        }
         libraryRevision += 1
     }
 
-    private func applyIncrementalLocalInserts(_ details: PHFetchResultChangeDetails<PHAsset>) {
-        guard let indexes = details.insertedIndexes, !indexes.isEmpty else { return }
-
-        let result = details.fetchResultAfterChanges
-        var updated = items
-        var existingIDs = Set(updated.map(\.id))
-
-        for index in indexes {
-            let asset = result.object(at: index)
-            let id = asset.localIdentifier
-            guard !existingIDs.contains(id) else { continue }
-            guard LivePhotoLocalAvailability.isAssetAvailableOffline(asset) else { continue }
-            updated.append(LivePhotoItem(id: id, asset: asset))
-            existingIDs.insert(id)
-        }
-
-        items = updated
-        libraryRevision += 1
-    }
-
-    private func scheduleInitialLoad(options: PHFetchOptions) {
+    private func scheduleInitialLoad() {
         reloadTask?.cancel()
         reloadGeneration += 1
         let generation = reloadGeneration
@@ -491,8 +537,17 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
 
         reloadTask = Task {
             let result = await Task.detached(priority: .userInitiated) {
-                PHAsset.fetchAssets(with: .image, options: options)
+                Self.livePhotoFetchResult()
             }.value
+            guard let result else {
+                guard generation == reloadGeneration else { return }
+                fetchResult = nil
+                items = []
+                isLoading = false
+                loadingStatusMessage = ""
+                libraryRevision += 1
+                return
+            }
 
             guard generation == reloadGeneration else { return }
             guard hasLibraryAccess else {
@@ -508,8 +563,9 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
                 : "Found \(count) Live Photos…"
 
             if !showsLocalLibraryOnly {
+                let order = displayOrder
                 let initialItems = await Task.detached(priority: .userInitiated) {
-                    Self.buildInitialItems(from: result)
+                    Self.buildInitialItems(from: result, order: order)
                 }.value
 
                 guard generation == reloadGeneration else { return }
@@ -528,7 +584,7 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
 
     private func scheduleItemsRebuild(
         showLoading: Bool,
-        build: @escaping @Sendable () -> LivePhotoSnapshot
+        build: @escaping @Sendable () -> LivePhotoSnapshot?
     ) {
         reloadTask?.cancel()
         reloadGeneration += 1
@@ -543,6 +599,15 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
             let snapshot = await Task.detached(priority: .userInitiated) {
                 build()
             }.value
+            guard let snapshot else {
+                guard generation == reloadGeneration else { return }
+                fetchResult = nil
+                items = []
+                isLoading = false
+                loadingStatusMessage = ""
+                libraryRevision += 1
+                return
+            }
 
             guard generation == reloadGeneration else { return }
             guard hasLibraryAccess else {
@@ -562,7 +627,9 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
 
             fetchResult = snapshot.fetchResult
             if !showsLocalLibraryOnly {
-                items = snapshot.items
+                items = displayOrder == .newestFirst
+                    ? snapshot.items
+                    : Self.buildInitialItems(from: snapshot.fetchResult, order: displayOrder)
                 libraryRevision += 1
                 if showLoading {
                     isLoading = false
@@ -593,48 +660,57 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
         switch mode {
         case .initial:
             items = []
-            libraryRevision += 1
             isLoading = true
             isOfflineFiltering = true
             loadingStatusMessage = "Finding photos on this device…"
         case .refresh:
-            break
+            isOfflineFiltering = true
+            loadingStatusMessage = "Updating photo order…"
         }
 
-        offlineFilterTask = Task {
-            let filtered = await Task.detached(priority: .utility) { [fetchResult, generation] in
-                var accumulated: [LivePhotoItem] = []
-                accumulated.reserveCapacity(min(fetchResult.count, 4_096))
-
+        offlineFilterTask = Task { [weak self] in
+            guard let self else { return }
+            let oldestFirst = displayOrder == .oldestFirst
+            let publishBatches: Bool
+            switch mode {
+            case .initial: publishBatches = true
+            case .refresh: publishBatches = false
+            }
+            let scanTask = Task.detached(priority: .utility) { [fetchResult, generation] in
                 return LivePhotoLocalAvailability.filterOfflineItems(
                     from: fetchResult,
+                    oldestFirst: oldestFirst,
                     onProgress: { progress in
                         let message = Self.progressMessage(for: progress)
-                        Task { @MainActor [weak self] in
-                            guard let self, generation == self.offlineFilterGeneration else { return }
+                        Task { @MainActor in
+                            guard publishBatches,
+                                  generation == self.offlineFilterGeneration,
+                                  self.isOfflineFiltering else { return }
                             self.loadingStatusMessage = message
                         }
                     },
                     onBatch: { batch in
-                        accumulated.append(contentsOf: batch)
-                        let snapshot = accumulated
-                        Task { @MainActor [weak self] in
-                            guard let self, generation == self.offlineFilterGeneration else { return }
-                            self.items = snapshot
-                            self.libraryRevision += 1
+                        Task { @MainActor in
+                            guard generation == self.offlineFilterGeneration else { return }
+                            self.items.append(contentsOf: batch)
                             self.isLoading = false
                         }
                     }
                 )
-            }.value
+            }
+            let filtered = await withTaskCancellationHandler {
+                await scanTask.value
+            } onCancel: {
+                scanTask.cancel()
+            }
 
             guard !Task.isCancelled, generation == offlineFilterGeneration else { return }
 
             items = filtered
-            libraryRevision += 1
             isOfflineFiltering = false
             isLoading = false
             loadingStatusMessage = ""
+            libraryRevision += 1
         }
     }
 
@@ -649,21 +725,26 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
 
         var restored: [LivePhotoItem] = []
         let initialCount = min(Self.pageSize, fetchResult.count)
-        Self.appendItems(from: fetchResult, start: 0, end: initialCount, into: &restored)
+        Self.appendItems(from: fetchResult, start: 0, end: initialCount, order: displayOrder, into: &restored)
         items = restored
-        libraryRevision += 1
     }
 
-    private static func livePhotoFetchOptions() -> PHFetchOptions {
+    nonisolated private static func livePhotoFetchOptions() -> PHFetchOptions {
         let options = PHFetchOptions()
-        options.predicate = NSPredicate(
-            format: "(mediaSubtype & %d) != 0",
-            PHAssetMediaSubtype.photoLive.rawValue
-        )
         options.sortDescriptors = [
             NSSortDescriptor(key: "creationDate", ascending: false)
         ]
         return options
+    }
+
+    nonisolated private static func livePhotoFetchResult() -> PHFetchResult<PHAsset>? {
+        let collections = PHAssetCollection.fetchAssetCollections(
+            with: .smartAlbum,
+            subtype: .smartAlbumLivePhotos,
+            options: nil
+        )
+        guard let livePhotos = collections.firstObject else { return nil }
+        return PHAsset.fetchAssets(in: livePhotos, options: livePhotoFetchOptions())
     }
 
     private struct LivePhotoSnapshot {
@@ -671,8 +752,8 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
         let items: [LivePhotoItem]
     }
 
-    nonisolated private static func fetchLivePhotoSnapshot(options: PHFetchOptions) -> LivePhotoSnapshot {
-        let result = PHAsset.fetchAssets(with: .image, options: options)
+    nonisolated private static func fetchLivePhotoSnapshot() -> LivePhotoSnapshot? {
+        guard let result = livePhotoFetchResult() else { return nil }
         return buildItems(from: result)
     }
 
@@ -680,41 +761,115 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
         LivePhotoSnapshot(fetchResult: result, items: buildInitialItems(from: result))
     }
 
-    nonisolated private static func buildInitialItems(from result: PHFetchResult<PHAsset>) -> [LivePhotoItem] {
+    nonisolated private static func buildInitialItems(
+        from result: PHFetchResult<PHAsset>,
+        order: LivePhotoReviewOrder = .newestFirst
+    ) -> [LivePhotoItem] {
         let initialCount = min(pageSize, result.count)
         var items: [LivePhotoItem] = []
         items.reserveCapacity(initialCount)
-        appendItems(from: result, start: 0, end: initialCount, into: &items)
+        appendItems(from: result, start: 0, end: initialCount, order: order, into: &items)
         return items
     }
 
     private func appendItems(from result: PHFetchResult<PHAsset>, start: Int, end: Int) {
         var updated = items
-        Self.appendItems(from: result, start: start, end: end, into: &updated)
+        Self.appendItems(from: result, start: start, end: end, order: displayOrder, into: &updated)
         items = updated
-        libraryRevision += 1
     }
 
     /// Builds a shuffled review deck without loading the entire library into memory.
-    func makeReviewDeck(maxCount: Int = 500) -> [LivePhotoItem] {
-        guard let fetchResult, fetchResult.count > 0 else { return items }
+    func makeReviewDeck(
+        maxCount: Int = 500,
+        order: LivePhotoReviewOrder = .newestFirst
+    ) -> [LivePhotoItem] {
+        guard let fetchResult, fetchResult.count > 0 else {
+            return orderedReviewItems(items, order: order, maxCount: maxCount)
+        }
 
         if showsLocalLibraryOnly {
             guard !items.isEmpty else { return [] }
-            return Array(items.shuffled().prefix(maxCount))
+            return orderedReviewItems(items, order: order, maxCount: maxCount)
         }
 
         let count = fetchResult.count
-        if count <= maxCount {
-            loadAllItemsIfNeeded()
-            return items.shuffled()
+        var indices: [Int]
+        switch order {
+        case .newestFirst:
+            indices = Array(0 ..< min(count, maxCount))
+        case .oldestFirst:
+            indices = Array(max(0, count - maxCount) ..< count).reversed()
+        case .random:
+            indices = Array(0 ..< count)
+            indices.shuffle()
+            indices = Array(indices.prefix(maxCount))
         }
-
-        var indices = Array(0 ..< count)
-        indices.shuffle()
         return indices.prefix(maxCount).map { index in
             let asset = fetchResult.object(at: index)
             return LivePhotoItem(id: asset.localIdentifier, asset: asset)
+        }
+    }
+
+    /// Builds a time-ordered review deck beginning at the photo the user chose in the grid.
+    func makeReviewDeck(
+        startingAt id: String,
+        maxCount: Int = 500,
+        order: LivePhotoReviewOrder = .newestFirst
+    ) -> [LivePhotoItem] {
+        if showsLocalLibraryOnly {
+            let ordered = orderedReviewItems(items, order: order, maxCount: items.count)
+            guard let start = ordered.firstIndex(where: { $0.id == id }) else {
+                return Array(ordered.prefix(maxCount))
+            }
+            return Array(ordered[start...].prefix(maxCount))
+        }
+        guard let fetchResult else {
+            let ordered = orderedReviewItems(items, order: order, maxCount: items.count)
+            guard let start = ordered.firstIndex(where: { $0.id == id }) else {
+                return Array(ordered.prefix(maxCount))
+            }
+            return Array(ordered[start...].prefix(maxCount))
+        }
+
+        let matching = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil)
+        guard let asset = matching.firstObject else {
+            return makeReviewDeck(maxCount: maxCount, order: order)
+        }
+        let startIndex = fetchResult.index(of: asset)
+        guard startIndex != NSNotFound else {
+            return makeReviewDeck(maxCount: maxCount, order: order)
+        }
+
+        let indices: [Int]
+        switch order {
+        case .newestFirst:
+            indices = Array(startIndex ..< min(fetchResult.count, startIndex + maxCount))
+        case .oldestFirst:
+            indices = Array(stride(from: startIndex, through: max(0, startIndex - maxCount + 1), by: -1))
+        case .random:
+            var remaining = Array(0 ..< fetchResult.count).filter { $0 != startIndex }
+            remaining.shuffle()
+            indices = [startIndex] + remaining.prefix(max(0, maxCount - 1))
+        }
+
+        return indices.map { index in
+            let itemAsset = fetchResult.object(at: index)
+            return LivePhotoItem(id: itemAsset.localIdentifier, asset: itemAsset)
+        }
+    }
+
+    private func orderedReviewItems(
+        _ source: [LivePhotoItem],
+        order: LivePhotoReviewOrder,
+        maxCount: Int
+    ) -> [LivePhotoItem] {
+        switch order {
+        case .newestFirst, .oldestFirst:
+            return order == displayOrder
+                ? Array(source.prefix(maxCount))
+                : Array(source.reversed().prefix(maxCount))
+        case .random:
+            return Array(source.shuffled().prefix(maxCount))
         }
     }
 
@@ -724,7 +879,7 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
         appendItems(from: fetchResult, start: items.count, end: fetchResult.count)
     }
 
-    func allItemIDs() -> Set<String> {
+    func allItemIDs() async -> Set<String> {
         if showsLocalLibraryOnly {
             return Set(items.map(\.id))
         }
@@ -740,11 +895,16 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
             return ids
         }
 
-        var ids = Set<String>()
-        ids.reserveCapacity(fetchResult.count)
-        for index in 0 ..< fetchResult.count {
-            ids.insert(fetchResult.object(at: index).localIdentifier)
-        }
+        let revision = libraryRevision
+        let ids = await Task.detached(priority: .utility) {
+            var result = Set<String>()
+            result.reserveCapacity(fetchResult.count)
+            for index in 0 ..< fetchResult.count {
+                result.insert(fetchResult.object(at: index).localIdentifier)
+            }
+            return result
+        }.value
+        guard revision == libraryRevision else { return await allItemIDs() }
         cachedAllItemIDs = ids
         cachedAllItemIDsRevision = libraryRevision
         return ids
@@ -781,94 +941,171 @@ final class LivePhotoLibraryStore: NSObject, PHPhotoLibraryChangeObserver {
         from result: PHFetchResult<PHAsset>,
         start: Int,
         end: Int,
+        order: LivePhotoReviewOrder = .newestFirst,
         into items: inout [LivePhotoItem]
     ) {
         guard start < end else { return }
         let safeEnd = min(end, result.count)
         for index in start ..< safeEnd {
-            let asset = result.object(at: index)
+            let fetchIndex = visibleFetchIndex(index, count: result.count, order: order)
+            let asset = result.object(at: fetchIndex)
             items.append(LivePhotoItem(id: asset.localIdentifier, asset: asset))
         }
     }
 
+    nonisolated static func visibleFetchIndex(
+        _ index: Int,
+        count: Int,
+        order: LivePhotoReviewOrder
+    ) -> Int {
+        order == .oldestFirst ? count - 1 - index : index
+    }
+
     private func cachingRequestOptions() -> PHImageRequestOptions {
         let options = PHImageRequestOptions()
-        options.deliveryMode = .opportunistic
+        options.deliveryMode = .fastFormat
         options.resizeMode = .fast
-        options.isNetworkAccessAllowed = allowsPhotoLibraryNetworking
+        options.isNetworkAccessAllowed = false
         return options
     }
 }
 
 // MARK: - Thumbnail request helpers
 
-private final class ThumbnailRequestContext: @unchecked Sendable {
-    nonisolated(unsafe) var requestID: PHImageRequestID = PHInvalidImageRequestID
-    nonisolated(unsafe) var resumeOnce: ContinuationResumeGuard<ThumbnailRequestResult>?
-    nonisolated(unsafe) var bestDegradedImage: UIImage?
-    nonisolated(unsafe) var fallbackTask: Task<Void, Never>?
-
+final class ImageStreamRequestContext: @unchecked Sendable {
     private let lock = NSLock()
+    nonisolated(unsafe) private var requestID: PHImageRequestID = PHInvalidImageRequestID
+    nonisolated(unsafe) private var continuation: AsyncStream<ThumbnailImageEvent>.Continuation?
+    nonisolated(unsafe) private var timeoutTask: Task<Void, Never>?
+    nonisolated(unsafe) private var isComplete = false
+    nonisolated(unsafe) private var hasImage = false
 
-    nonisolated func storeDegraded(_ image: UIImage) {
+    nonisolated init(continuation: AsyncStream<ThumbnailImageEvent>.Continuation) {
+        self.continuation = continuation
+    }
+
+    nonisolated func setTimeoutTask(_ task: Task<Void, Never>) {
         lock.lock()
-        bestDegradedImage = image
+        if isComplete {
+            lock.unlock()
+            task.cancel()
+            return
+        }
+        timeoutTask = task
         lock.unlock()
     }
 
-    nonisolated func bestDegraded() -> UIImage? {
+    nonisolated func setRequestID(_ id: PHImageRequestID, using manager: PHCachingImageManager) {
         lock.lock()
-        defer { lock.unlock() }
-        return bestDegradedImage
+        let shouldCancel = isComplete
+        if !shouldCancel { requestID = id }
+        lock.unlock()
+        if shouldCancel { manager.cancelImageRequest(id) }
     }
 
-    nonisolated func complete(with result: ThumbnailRequestResult) {
+    nonisolated func send(image: UIImage, isFinal: Bool) {
         lock.lock()
-        fallbackTask?.cancel()
-        fallbackTask = nil
-        let resume = resumeOnce
-        resumeOnce = nil
+        guard !isComplete else { lock.unlock(); return }
+        hasImage = true
+        if isFinal {
+            isComplete = true
+            timeoutTask?.cancel()
+            timeoutTask = nil
+        }
+        let stream = continuation
+        if isFinal { continuation = nil }
         lock.unlock()
-        resume?.resume(returning: result)
+        stream?.yield(.image(image, isFinal: isFinal))
+        if isFinal { stream?.finish() }
+    }
+
+    nonisolated func finish(with event: ThumbnailImageEvent) {
+        lock.lock()
+        guard !isComplete else { lock.unlock(); return }
+        isComplete = true
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        let stream = continuation
+        let shouldEmitTerminalEvent = !hasImage
+        continuation = nil
+        lock.unlock()
+        if shouldEmitTerminalEvent { stream?.yield(event) }
+        stream?.finish()
+    }
+
+    nonisolated func timeout(using manager: PHCachingImageManager) {
+        lock.lock()
+        let hadImage = hasImage
+        let id = requestID
+        lock.unlock()
+        if hadImage { cancel(using: manager) }
+        else { finish(with: .failed); if id != PHInvalidImageRequestID { manager.cancelImageRequest(id) } }
     }
 
     nonisolated func cancel(using manager: PHCachingImageManager) {
-        if requestID != PHInvalidImageRequestID {
-            manager.cancelImageRequest(requestID)
-            requestID = PHInvalidImageRequestID
-        }
-        complete(with: .failed)
+        lock.lock()
+        guard !isComplete else { lock.unlock(); return }
+        isComplete = true
+        let id = requestID
+        let stream = continuation
+        continuation = nil
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        lock.unlock()
+        stream?.finish()
+        if id != PHInvalidImageRequestID { manager.cancelImageRequest(id) }
     }
 }
 
 private final class LivePhotoRequestContext: @unchecked Sendable {
-    nonisolated(unsafe) var requestID: PHImageRequestID = PHInvalidImageRequestID
-    nonisolated(unsafe) var resumeOnce: ContinuationResumeGuard<PHLivePhoto?>?
+    private let lock = NSLock()
+    nonisolated(unsafe) private var requestID: PHImageRequestID = PHInvalidImageRequestID
+    nonisolated(unsafe) private var continuation: CheckedContinuation<PHLivePhoto?, Never>?
+    nonisolated(unsafe) private var timeoutTask: Task<Void, Never>?
+    nonisolated(unsafe) private var isComplete = false
+
+    nonisolated func setContinuation(_ value: CheckedContinuation<PHLivePhoto?, Never>) {
+        lock.lock()
+        continuation = value
+        lock.unlock()
+    }
+
+    nonisolated func setTimeoutTask(_ task: Task<Void, Never>) {
+        lock.lock()
+        if isComplete {
+            lock.unlock()
+            task.cancel()
+            return
+        }
+        timeoutTask = task
+        lock.unlock()
+    }
+
+    nonisolated func setRequestID(_ id: PHImageRequestID, using manager: PHCachingImageManager) {
+        lock.lock()
+        let shouldCancel = isComplete
+        if !shouldCancel { requestID = id }
+        lock.unlock()
+        if shouldCancel { manager.cancelImageRequest(id) }
+    }
+
+    nonisolated func complete(with value: PHLivePhoto?) {
+        lock.lock()
+        guard !isComplete else { lock.unlock(); return }
+        isComplete = true
+        timeoutTask?.cancel()
+        timeoutTask = nil
+        let resume = continuation
+        continuation = nil
+        lock.unlock()
+        resume?.resume(returning: value)
+    }
 
     nonisolated func cancel(using manager: PHCachingImageManager) {
-        if requestID != PHInvalidImageRequestID {
-            manager.cancelImageRequest(requestID)
-            requestID = PHInvalidImageRequestID
-        }
-        resumeOnce?.resume(returning: nil)
-        resumeOnce = nil
-    }
-}
-
-private final class ContinuationResumeGuard<T>: @unchecked Sendable {
-    private let lock = NSLock()
-    nonisolated(unsafe) private var continuation: CheckedContinuation<T, Never>?
-
-    nonisolated init(continuation: CheckedContinuation<T, Never>) {
-        self.continuation = continuation
-    }
-
-    nonisolated func resume(returning value: T) {
         lock.lock()
-        defer { lock.unlock() }
-        guard let continuation else { return }
-        self.continuation = nil
-        continuation.resume(returning: value)
+        let id = requestID
+        lock.unlock()
+        complete(with: nil)
+        if id != PHInvalidImageRequestID { manager.cancelImageRequest(id) }
     }
 }
-

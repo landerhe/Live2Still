@@ -16,6 +16,9 @@ struct LivePhotoWelcomeView: View {
     @State private var symbolActive = false
 
     private var loadingLabel: String {
+        if store.authorizationStatus == .notDetermined {
+            return "Photo access comes next"
+        }
         if store.loadingStatusMessage.isEmpty {
             return store.isLoading ? "Scanning your Live Photos…" : "Ready"
         }
@@ -116,6 +119,9 @@ struct LivePhotoWelcomeView: View {
         HStack(spacing: 10) {
             if store.isLoading {
                 ProgressView()
+            } else if store.authorizationStatus == .notDetermined {
+                Image(systemName: "photo.badge.plus")
+                    .foregroundStyle(Color.accentColor)
             } else {
                 Image(systemName: "checkmark.circle.fill")
                     .foregroundStyle(.green)

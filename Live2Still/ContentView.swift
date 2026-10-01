@@ -14,10 +14,13 @@ struct ContentView: View {
     var store: LivePhotoLibraryStore
     @State private var converter = LivePhotoConverter()
     @State private var reviewSession = LivePhotoReviewSession()
+    @State private var cleanupStore = PhotoCleanupStore()
     @State private var showQueuedReview = false
     @State private var selectedTab: AppTab = .album
     @State private var selectedIDs: Set<String> = []
     @AppStorage(LivePhotoDesign.removeOriginalKey) private var removeOriginal = true
+    @AppStorage(LivePhotoDesign.analyzeCloudPhotosKey) private var analyzeCloudPhotos = false
+    @AppStorage("livePhotoReviewOrder") private var reviewOrder: LivePhotoReviewOrder = .newestFirst
     @State private var showAlert = false
     @State private var alertTitle = ""
     @State private var alertMessage = ""
@@ -30,6 +33,9 @@ struct ContentView: View {
     @State private var bannerMessage: String?
     @State private var bannerDismissTask: Task<Void, Never>?
     @State private var applyProgress: (completed: Int, total: Int)?
+    @State private var batchSummaryMessage: String?
+    @State private var batchAttentionIDs: Set<String> = []
+    @State private var batchMissingIDs: Set<String> = []
     @State private var lastFailedOperation: FailedOperation?
     @AppStorage(LivePhotoDesign.welcomeOnboardingKey) private var hasCompletedWelcomeOnboarding = false
 
@@ -42,6 +48,7 @@ struct ContentView: View {
     private enum AppTab: Hashable {
         case album
         case swipe
+        case cleanup
     }
 
     var body: some View {
@@ -70,7 +77,11 @@ struct ContentView: View {
                 }
             }
             .background(Color(.systemGroupedBackground))
-            .navigationTitle("Live Photos")
+            .onAppear {
+                if reviewOrder == .random { reviewOrder = .newestFirst }
+                store.setDisplayOrder(reviewOrder)
+            }
+            .navigationTitle(selectedTab == .cleanup ? "Clean Up" : "Live Photos")
             .navigationBarTitleDisplayMode(.inline)
             .navigationSubtitle(contextNavigationSubtitle)
             .toolbar { toolbarContent }
@@ -85,6 +96,16 @@ struct ContentView: View {
             }
             .onChange(of: store.libraryRevision) { _, _ in
                 syncReviewSessionWithLibrary()
+            }
+            .onChange(of: store.items.count) { _, _ in
+                guard store.showsLocalLibraryOnly, selectedTab == .swipe else { return }
+                reviewSession.appendDiscoveredItems(
+                    store.items,
+                    maxCount: LivePhotoDesign.reviewDeckMaxCount
+                )
+            }
+            .onChange(of: reviewOrder) { _, newOrder in
+                applyPhotoOrder(newOrder)
             }
             .alert(alertTitle, isPresented: $showAlert) {
                 if let lastFailedOperation {
@@ -133,7 +154,7 @@ struct ContentView: View {
                 titleVisibility: .visible
             ) {
                 Button("Select All \(store.livePhotoCount)") {
-                    selectedIDs = store.allItemIDs()
+                    Task { selectedIDs = await store.allItemIDs() }
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
@@ -145,6 +166,8 @@ struct ContentView: View {
                     session: reviewSession,
                     removeOriginal: $removeOriginal,
                     isProcessing: converter.isConverting || applyProgress != nil,
+                    summaryMessage: batchSummaryMessage,
+                    attentionIDs: batchAttentionIDs,
                     onApply: beginApplyQueuedActions
                 )
             }
@@ -164,20 +187,16 @@ struct ContentView: View {
     }
 
     private var libraryScreen: LibraryScreen {
+        if !hasCompletedWelcomeOnboarding { return .welcome }
+        if store.isPreparing { return .loading }
         if store.authorizationStatus == .notDetermined {
             return .needsPermission
         }
         if !store.hasLibraryAccess {
             return .denied
         }
-        if !hasCompletedWelcomeOnboarding {
-            return .welcome
-        }
         if (store.isLoading || store.isOfflineFiltering) && store.items.isEmpty {
             return .loading
-        }
-        if store.livePhotoCount == 0 {
-            return .empty
         }
         return .album
     }
@@ -192,6 +211,9 @@ struct ContentView: View {
             return "Tap photos to select"
         }
 
+        if selectedTab == .cleanup {
+            return "On-device suggestions"
+        }
         if reviewSession.hasQueuedActions, selectedTab == .swipe {
             return "Queue: \(swipeQueueStatusSummary) — tap Apply when ready"
         }
@@ -213,24 +235,44 @@ struct ContentView: View {
     private var libraryTabView: some View {
         TabView(selection: $selectedTab) {
             Tab("Album", systemImage: "square.grid.2x2", value: AppTab.album) {
-                LivePhotoGridView(
-                    store: store,
-                    selectedIDs: $selectedIDs,
-                    isCachingEnabled: selectedTab == .album
-                )
+                if store.livePhotoCount == 0 {
+                    emptyLibraryView
+                } else {
+                    LivePhotoGridView(
+                        store: store,
+                        selectedIDs: $selectedIDs,
+                        isCachingEnabled: selectedTab == .album,
+                        onOpenInSwipe: startReviewFromGrid
+                    )
+                }
             }
 
             Tab("Swipe", systemImage: "hand.draw", value: AppTab.swipe) {
                 Group {
-                    if selectedTab == .swipe {
+                    if store.livePhotoCount == 0 {
+                        emptyLibraryView
+                    } else if selectedTab == .swipe {
                         LivePhotoReviewView(
                             store: store,
                             session: reviewSession,
+                            reviewOrder: reviewOrder,
                             onStartIfNeeded: startReviewSessionIfNeeded,
-                            onSyncWithLibrary: syncReviewSessionWithLibrary,
                             showQueuedReview: $showQueuedReview,
                             isQueueProcessing: converter.isConverting || applyProgress != nil,
                             onApplyQueuedActions: beginApplyQueuedActions
+                        )
+                    } else {
+                        Color.clear
+                    }
+                }
+            }
+
+            Tab("Clean Up", systemImage: "sparkles.rectangle.stack", value: AppTab.cleanup) {
+                Group {
+                    if selectedTab == .cleanup {
+                        PhotoCleanupView(
+                            libraryStore: store,
+                            cleanupStore: cleanupStore
                         )
                     } else {
                         Color.clear
@@ -461,13 +503,19 @@ struct ContentView: View {
             )
         } description: {
             if store.showsLocalLibraryOnly {
-                Text("None of your Live Photos are downloaded to this device. Turn off “On this device only” to browse iCloud photos, or download them in the Photos app first.")
+                Text("No Live Photos are available on this device. Download them in Photos, or choose to show iCloud photos here.")
             } else if store.isLimited {
                 Text("No Live Photos in your current selection. Use Add Photos in the menu to include more, or allow full library access in Settings.")
             } else {
                 Text("Take a Live Photo with the Camera app, then return here to convert it to a still.")
             }
         } actions: {
+            if store.showsLocalLibraryOnly {
+                Button("Show iCloud Photos") {
+                    store.setShowLocalLibraryOnly(false)
+                }
+                .buttonStyle(.glassProminent)
+            }
             if store.isLimited {
                 Button("Add Photos") {
                     presentLimitedLibraryPicker()
@@ -513,11 +561,12 @@ struct ContentView: View {
                     .accessibilityLabel("Swipe queue, \(reviewSession.queuedMembershipCount) items")
                 }
 
+                orderMenu
                 settingsMenu
             }
-        } else if libraryScreen == .album, selectedTab == .swipe {
+        } else if libraryScreen == .album, selectedTab == .swipe || selectedTab == .cleanup {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                if reviewSession.hasQueuedActions {
+                if selectedTab == .swipe, reviewSession.hasQueuedActions {
                     Button {
                         showQueuedReview = true
                     } label: {
@@ -527,6 +576,7 @@ struct ContentView: View {
                     .accessibilityLabel("Swipe queue, \(reviewSession.queuedMembershipCount) items")
                 }
 
+                if selectedTab == .swipe { orderMenu }
                 settingsMenu
             }
         } else if store.isLimited {
@@ -544,13 +594,14 @@ struct ContentView: View {
     private var settingsMenu: some View {
         Menu {
             Toggle(
-                "On this device only",
+                "Show iCloud Photos",
                 isOn: Binding(
-                    get: { store.showLocalLibraryOnly },
-                    set: { store.setShowLocalLibraryOnly($0) }
+                    get: { !store.showLocalLibraryOnly },
+                    set: { store.setShowLocalLibraryOnly(!$0) }
                 )
             )
-            .disabled(store.isOfflineMode)
+            Toggle("Analyze iCloud Photos", isOn: $analyzeCloudPhotos)
+                .disabled(store.showLocalLibraryOnly)
             Toggle("Remove original Live Photo", isOn: $removeOriginal)
             Button {
                 openSettings()
@@ -574,6 +625,44 @@ struct ContentView: View {
             Image(systemName: "ellipsis.circle")
         }
         .accessibilityLabel("Settings")
+    }
+
+    private var orderMenu: some View {
+        Menu {
+            ForEach([LivePhotoReviewOrder.newestFirst, .oldestFirst]) { order in
+                Button {
+                    if reviewOrder == order { applyPhotoOrder(order) }
+                    else { reviewOrder = order }
+                } label: {
+                    Label(order.title, systemImage: reviewOrder == order ? "checkmark" : "circle")
+                }
+            }
+            if selectedTab == .swipe {
+                Button("Shuffle Swipe", systemImage: "shuffle") {
+                    reviewSession.startNewDeckPreservingQueue(
+                        deck: store.makeReviewDeck(
+                            maxCount: LivePhotoDesign.reviewDeckMaxCount,
+                            order: .random
+                        )
+                    )
+                    presentBanner("Review shuffled. Your queue is saved.")
+                }
+            }
+        } label: {
+            Image(systemName: "arrow.up.arrow.down")
+        }
+        .accessibilityLabel("Photo order, \(reviewOrder.title)")
+    }
+
+    private func applyPhotoOrder(_ order: LivePhotoReviewOrder) {
+        store.setDisplayOrder(order)
+        guard selectedTab == .swipe else { return }
+        let deck = store.makeReviewDeck(
+            maxCount: LivePhotoDesign.reviewDeckMaxCount,
+            order: order
+        )
+        reviewSession.startNewDeckPreservingQueue(deck: deck)
+        presentBanner("Review restarted in \(order.title) order. Your queue is saved.")
     }
 
     @ViewBuilder
@@ -604,13 +693,32 @@ struct ContentView: View {
     // MARK: - Review session
 
     private func startReviewSessionIfNeeded() {
-        let deck = store.makeReviewDeck(maxCount: LivePhotoDesign.reviewDeckMaxCount)
+        let deck = store.makeReviewDeck(
+            maxCount: LivePhotoDesign.reviewDeckMaxCount,
+            order: reviewOrder
+        )
         reviewSession.start(deck: deck)
         reviewSession.startIfDeckEmpty(deck: deck)
     }
 
+    private func startReviewFromGrid(_ item: LivePhotoItem) {
+        let deck = store.makeReviewDeck(
+            startingAt: item.id,
+            maxCount: LivePhotoDesign.reviewDeckMaxCount,
+            order: reviewOrder
+        )
+        reviewSession.startNewDeckPreservingQueue(deck: deck)
+        selectedTab = .swipe
+    }
+
     private func syncReviewSessionWithLibrary() {
-        reviewSession.syncWithAvailableIDs(store.allItemIDs())
+        guard !store.isOfflineFiltering else { return }
+        guard !reviewSession.deck.isEmpty || reviewSession.hasQueuedActions else { return }
+        Task {
+            let ids = await store.allItemIDs()
+            guard !store.isOfflineFiltering else { return }
+            reviewSession.syncWithAvailableIDs(ids)
+        }
     }
 
     // MARK: - Queue apply
@@ -621,6 +729,9 @@ struct ContentView: View {
 
         pendingConversionIDs = reviewSession.convertQueue
         pendingDeleteIDs = reviewSession.deleteQueue
+        batchSummaryMessage = nil
+        batchAttentionIDs = []
+        batchMissingIDs = []
 
         if shouldConfirmApplyQueue {
             showApplyQueueConfirm = true
@@ -658,7 +769,6 @@ struct ContentView: View {
             applyProgress = nil
             pendingConversionIDs = nil
             pendingDeleteIDs = nil
-            showQueuedReview = false
         }
 
         if !convertIDs.isEmpty {
@@ -669,7 +779,8 @@ struct ContentView: View {
                     applyProgress = (completed, totalSteps)
                 }
             )
-            applyProgress = (convertIDs.count, totalSteps)
+            let completed = convertIDs.subtracting(reviewSession.convertQueue).count
+            applyProgress = (completed, totalSteps)
         }
 
         if !deleteIDs.isEmpty {
@@ -677,10 +788,24 @@ struct ContentView: View {
             await performBatchDelete(
                 skipApplyProgressReset: true,
                 progress: { completed, _ in
-                    applyProgress = (convertIDs.count + completed, totalSteps)
+                    let converted = convertIDs.subtracting(reviewSession.convertQueue).count
+                    applyProgress = (converted + completed, totalSteps)
                 }
             )
         }
+
+        let remaining = convertIDs.intersection(reviewSession.convertQueue)
+            .union(deleteIDs.intersection(reviewSession.deleteQueue))
+        let summary = BatchActionSummary(
+            requested: convertIDs.union(deleteIDs),
+            missing: batchMissingIDs,
+            attention: remaining
+        )
+        batchAttentionIDs = remaining
+        batchSummaryMessage = summary.message
+        showQueuedReview = !remaining.isEmpty
+        lastFailedOperation = nil
+        if remaining.isEmpty { presentBanner(summary.message) }
     }
 
     // MARK: - Batch delete
@@ -695,9 +820,12 @@ struct ContentView: View {
         }
 
         let assets = store.assets(for: ids)
+        let resolvedIDs = Set(assets.map(\.localIdentifier))
+        let missingIDs = ids.subtracting(resolvedIDs)
+        if skipApplyProgressReset { batchMissingIDs.formUnion(missingIDs) }
         guard !assets.isEmpty else {
             reviewSession.removeDeletedFromQueue(ids)
-            if assets.isEmpty, !ids.isEmpty {
+            if !skipApplyProgressReset {
                 presentBanner("Some queued photos were already removed from your library.")
             }
             return
@@ -707,21 +835,22 @@ struct ContentView: View {
 
         do {
             try await store.deleteAssets(assets)
-            let deletedIDs = Set(assets.map(\.localIdentifier))
+            let deletedIDs = await store.confirmedRemovedIDs(resolvedIDs)
             selectedIDs.subtract(deletedIDs)
             reviewSession.removeDeletedFromQueue(deletedIDs)
-            // Drop IDs that vanished before delete could run.
-            reviewSession.removeDeletedFromQueue(ids.subtracting(deletedIDs))
-            reviewSession.syncWithAvailableIDs(store.allItemIDs())
+            reviewSession.removeDeletedFromQueue(missingIDs)
+            reviewSession.syncWithAvailableIDs(await store.allItemIDs())
 
-            let count = assets.count
-            presentBanner(
-                "Deleted \(count) Live Photo\(count == 1 ? "" : "s") from your library."
-            )
+            let count = deletedIDs.count
+            if !skipApplyProgressReset {
+                presentBanner("Deleted \(count) Live Photo\(count == 1 ? "" : "s") from your library.")
+            }
             progress?(count, count)
         } catch {
             lastFailedOperation = .delete(ids)
-            presentAlert(title: "Delete Failed", message: error.localizedDescription)
+            if !skipApplyProgressReset {
+                presentAlert(title: "Delete Failed", message: error.localizedDescription)
+            }
         }
     }
 
@@ -763,9 +892,14 @@ struct ContentView: View {
         }
 
         let assets = store.assets(for: ids)
+        let resolvedIDs = Set(assets.map(\.localIdentifier))
+        let missingIDs = ids.subtracting(resolvedIDs)
+        if skipApplyProgressReset { batchMissingIDs.formUnion(missingIDs) }
         guard !assets.isEmpty else {
             reviewSession.removeConvertedFromQueue(ids)
-            presentBanner("Some queued photos were already removed from your library.")
+            if !skipApplyProgressReset {
+                presentBanner("Some queued photos were already removed from your library.")
+            }
             return
         }
 
@@ -778,30 +912,31 @@ struct ContentView: View {
                 progress: progress
             )
 
-            selectedIDs.subtract(Set(result.convertedSourceIDs))
-            reviewSession.removeConvertedFromQueue(Set(result.convertedSourceIDs))
+            let completedIDs = removeOriginal
+                ? Set(result.originalsRemovedSourceIDs)
+                : Set(result.convertedSourceIDs)
+            selectedIDs.subtract(completedIDs)
+            reviewSession.removeConvertedFromQueue(completedIDs.union(missingIDs))
             if fromSwipe {
-                reviewSession.syncWithAvailableIDs(store.allItemIDs())
+                reviewSession.syncWithAvailableIDs(await store.allItemIDs())
             }
 
-            if result.failed > 0 {
+            if result.failed > 0 || result.originalsRemovalCanceled {
+                let retryIDs = Set(result.failedSourceIDs).union(result.retainedSourceIDs)
                 lastFailedOperation = skipApplyProgressReset
-                    ? .queue(convertIDs: Set(result.failedSourceIDs), deleteIDs: pendingDeleteIDs ?? [])
-                    : .conversion(Set(result.failedSourceIDs))
-                presentAlert(
-                    title: "Partially Completed",
-                    message: conversionResultMessage(result: result, removeOriginal: removeOriginal)
-                )
-            } else if result.originalsRemovalCanceled {
-                presentBanner(
-                    conversionResultMessage(result: result, removeOriginal: removeOriginal)
-                )
-            } else {
+                    ? .queue(convertIDs: retryIDs, deleteIDs: pendingDeleteIDs ?? [])
+                    : .conversion(retryIDs)
+                if !skipApplyProgressReset {
+                    presentAlert(title: "Partially Completed", message: conversionResultMessage(result: result, removeOriginal: removeOriginal))
+                }
+            } else if !skipApplyProgressReset {
                 presentBanner(conversionResultMessage(result: result, removeOriginal: removeOriginal))
             }
         } catch {
             lastFailedOperation = .conversion(ids)
-            presentAlert(title: "Conversion Failed", message: error.localizedDescription)
+            if !skipApplyProgressReset {
+                presentAlert(title: "Conversion Failed", message: error.localizedDescription)
+            }
         }
     }
 
@@ -828,18 +963,18 @@ struct ContentView: View {
         removeOriginal: Bool
     ) -> String {
         let count = result.succeeded
-        let photoWord = count == 1 ? "Live Photo" : "Live Photos"
-        let stillWord = count == 1 ? "still" : "stills"
-
-        var message: String
+        var message = "Still photo\(count == 1 ? "" : "s") saved for \(count) Live Photo\(count == 1 ? "" : "s")."
         if result.failed > 0 {
-            message = "Converted \(count) photo\(count == 1 ? "" : "s"). \(result.failed) failed."
-        } else {
-            message = "Converted \(count) \(photoWord) to \(stillWord)."
-            if result.originalsRemovalCanceled {
-                message += " Originals were kept because deletion was canceled."
-            } else if removeOriginal {
-                message += " Original\(count == 1 ? "" : "s") removed."
+            message += " \(result.failed) could not be converted."
+        }
+        if removeOriginal {
+            let removed = result.originalsRemovedSourceIDs.count
+            if removed > 0 {
+                message += " \(removed) original\(removed == 1 ? "" : "s") removed."
+            }
+            let retained = result.retainedSourceIDs.count
+            if retained > 0 {
+                message += " \(retained) original\(retained == 1 ? "" : "s") remain. Retry will remove them without making new stills."
             }
         }
 
