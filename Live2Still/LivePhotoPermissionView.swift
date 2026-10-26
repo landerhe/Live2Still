@@ -27,7 +27,7 @@ struct LivePhotoPermissionView: View {
                     .font(.title2.weight(.semibold))
                     .multilineTextAlignment(.center)
 
-                Text("Turn Live Photos into stills and free up storage.")
+                Text("Save still copies and review Live Photos in batches.")
                     .font(.body)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
@@ -36,7 +36,7 @@ struct LivePhotoPermissionView: View {
             VStack(alignment: .leading, spacing: 12) {
                 permissionTip(
                     icon: "photo.on.rectangle.angled",
-                    text: "Live2Still needs access to your photo library to find Live Photos."
+                    text: "Live2Still reads the photos you allow to find Live Photos and offer optional on-device review suggestions."
                 )
                 permissionTip(
                     icon: "photo.stack",

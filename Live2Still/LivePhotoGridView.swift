@@ -13,10 +13,22 @@ struct LivePhotoGridView: View {
     var isCachingEnabled: Bool = true
     var onOpenInSwipe: (LivePhotoItem) -> Void
 
+    @Environment(\.displayScale) private var displayScale
     @State private var previewItem: LivePhotoItem?
     @State private var cachedWindowAssets: [PHAsset] = []
     @State private var cachedWindowSize: CGSize = .zero
     @State private var cachedWindowRange: Range<Int>?
+    @State private var cellFrameStore = CellFrameStore()
+    @State private var dragSelection: DragSelection?
+    @State private var ignoresCurrentDrag = false
+    @State private var containerWidth: CGFloat = 390
+    @GestureState private var isDragging = false
+
+    private struct DragSelection {
+        let isSelecting: Bool
+        var visitedIDs: Set<String>
+        var lastLocation: CGPoint
+    }
 
     var body: some View {
         ScrollView {
@@ -28,10 +40,18 @@ struct LivePhotoGridView: View {
                         totalCount: store.livePhotoCount,
                         store: store,
                         isSelected: selectedIDs.contains(item.id),
-                        onTap: { onOpenInSwipe(item) },
-                        onToggleSelection: { toggleSelection(item.id) },
-                        onLongPress: { previewItem = item }
+                        targetSize: thumbnailTargetSize(),
+                        onTap: { previewItem = item },
+                        onToggleSelection: { toggleSelection(item.id) }
                     )
+                    .background {
+                        GeometryReader { geometry in
+                            Color.clear.preference(
+                                key: AlbumCellFramesKey.self,
+                                value: [item.id: geometry.frame(in: .named("albumGrid"))]
+                            )
+                        }
+                    }
                     .onAppear {
                         store.loadMoreItemsIfNeeded(visibleIndex: index)
                         if isCachingEnabled {
@@ -41,7 +61,7 @@ struct LivePhotoGridView: View {
                 }
 
                 if !store.hasLoadedAllItems {
-                    ProgressView("Loading more…")
+                    ProgressView(store.showsLocalLibraryOnly ? store.loadingStatusMessage : "Loading more…")
                         .frame(maxWidth: .infinity)
                         .padding(.vertical, 16)
                         .gridCellColumns(1)
@@ -51,6 +71,26 @@ struct LivePhotoGridView: View {
                 }
             }
         }
+        .coordinateSpace(name: "albumGrid")
+        .scrollDisabled(dragSelection != nil)
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 8, coordinateSpace: .named("albumGrid"))
+                .updating($isDragging) { _, dragging, _ in dragging = true }
+                .onChanged(updateDragSelection)
+                .onEnded { _ in
+                    dragSelection = nil
+                    ignoresCurrentDrag = false
+                }
+        )
+        .onPreferenceChange(AlbumCellFramesKey.self) { frames in
+            cellFrameStore.frames = frames
+        }
+        .onChange(of: isDragging) { _, dragging in
+            if !dragging {
+                dragSelection = nil
+                ignoresCurrentDrag = false
+            }
+        }
         .onChange(of: isCachingEnabled) { _, enabled in
             if !enabled {
                 stopCacheWindow()
@@ -58,10 +98,22 @@ struct LivePhotoGridView: View {
         }
         .onDisappear {
             stopCacheWindow()
+            dragSelection = nil
+            ignoresCurrentDrag = false
         }
         .fullScreenCover(item: $previewItem) { item in
             LivePhotoAlbumPreviewView(item: item, store: store) {
                 previewItem = nil
+            } onReview: {
+                previewItem = nil
+                onOpenInSwipe(item)
+            }
+        }
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear { containerWidth = geometry.size.width }
+                    .onChange(of: geometry.size.width) { _, width in containerWidth = width }
             }
         }
     }
@@ -74,10 +126,66 @@ struct LivePhotoGridView: View {
         }
     }
 
+    private func updateDragSelection(_ value: DragGesture.Value) {
+        guard !ignoresCurrentDrag else { return }
+        if dragSelection == nil {
+            guard let (startID, frame) = cellFrameStore.frames.first(where: { $0.value.contains(value.startLocation) }) else {
+                ignoresCurrentDrag = true
+                return
+            }
+            let circleFrame = CGRect(x: frame.maxX - 44, y: frame.minY, width: 44, height: 44)
+            let startsAcrossRow = abs(value.translation.width) > abs(value.translation.height) * 1.2
+            guard circleFrame.contains(value.startLocation) || startsAcrossRow else {
+                ignoresCurrentDrag = true
+                return
+            }
+            dragSelection = DragSelection(
+                isSelecting: !selectedIDs.contains(startID),
+                visitedIDs: [startID],
+                lastLocation: value.startLocation
+            )
+            if selectedIDs.contains(startID) {
+                selectedIDs.remove(startID)
+            } else {
+                selectedIDs.insert(startID)
+            }
+        }
+        guard var selection = dragSelection else { return }
+
+        let from = selection.lastLocation
+        let to = value.location
+        let distance = hypot(to.x - from.x, to.y - from.y)
+        let steps = max(1, Int(ceil(distance / 8)))
+        var crossedIDs: Set<String> = []
+        for step in 0 ... steps {
+            let fraction = CGFloat(step) / CGFloat(steps)
+            let point = CGPoint(
+                x: from.x + (to.x - from.x) * fraction,
+                y: from.y + (to.y - from.y) * fraction
+            )
+            for (id, frame) in cellFrameStore.frames where frame.contains(point) {
+                crossedIDs.insert(id)
+            }
+        }
+
+        let newlyCrossed = crossedIDs.subtracting(selection.visitedIDs)
+        if !newlyCrossed.isEmpty {
+            if selection.isSelecting {
+                selectedIDs.formUnion(newlyCrossed)
+            } else {
+                selectedIDs.subtract(newlyCrossed)
+            }
+            selection.visitedIDs.formUnion(newlyCrossed)
+        }
+        selection.lastLocation = to
+        dragSelection = selection
+    }
+
     private func thumbnailTargetSize() -> CGSize {
-        let scale = UITraitCollection.current.displayScale
-        let side = LivePhotoDesign.gridMaximumCellWidth * scale
-        return CGSize(width: side, height: side)
+        LivePhotoThumbnailSizing.gridCellTargetSize(
+            containerWidth: containerWidth,
+            displayScale: displayScale
+        )
     }
 
     private func updateCacheWindow(around visibleIndex: Int) {
@@ -99,14 +207,23 @@ struct LivePhotoGridView: View {
             return
         }
 
-        if !cachedWindowAssets.isEmpty, cachedWindowSize != .zero {
-            store.stopCaching(assets: cachedWindowAssets, targetSize: cachedWindowSize)
+        if cachedWindowSize == size {
+            let oldIDs = Set(cachedWindowAssets.map(\.localIdentifier))
+            let newIDs = Set(assets.map(\.localIdentifier))
+            let leaving = cachedWindowAssets.filter { !newIDs.contains($0.localIdentifier) }
+            let entering = assets.filter { !oldIDs.contains($0.localIdentifier) }
+            store.stopCaching(assets: leaving, targetSize: size)
+            store.startCaching(assets: entering, targetSize: size)
+        } else {
+            if !cachedWindowAssets.isEmpty, cachedWindowSize != .zero {
+                store.stopCaching(assets: cachedWindowAssets, targetSize: cachedWindowSize)
+            }
+            store.startCaching(assets: assets, targetSize: size)
         }
 
         cachedWindowAssets = assets
         cachedWindowSize = size
         cachedWindowRange = lower ..< upper
-        store.startCaching(assets: assets, targetSize: size)
     }
 
     private func stopCacheWindow() {
@@ -124,17 +241,41 @@ private struct LivePhotoGridCell: View {
     let totalCount: Int
     let store: LivePhotoLibraryStore
     let isSelected: Bool
+    let targetSize: CGSize
     let onTap: () -> Void
     let onToggleSelection: () -> Void
-    let onLongPress: () -> Void
 
-    @State private var thumbnailState: ThumbnailDisplayState = .loading
+    @State private var thumbnailState: ThumbnailDisplayState
+    @State private var retryAttempt = 0
+    @State private var performedRetryAttempt = 0
     @State private var loadToken = 0
 
-    private var targetSize: CGSize {
-        let scale = UITraitCollection.current.displayScale
-        let side = LivePhotoDesign.gridMaximumCellWidth * scale
-        return CGSize(width: side, height: side)
+    init(
+        item: LivePhotoItem,
+        itemIndex: Int,
+        totalCount: Int,
+        store: LivePhotoLibraryStore,
+        isSelected: Bool,
+        targetSize: CGSize,
+        onTap: @escaping () -> Void,
+        onToggleSelection: @escaping () -> Void
+    ) {
+        self.item = item
+        self.itemIndex = itemIndex
+        self.totalCount = totalCount
+        self.store = store
+        self.isSelected = isSelected
+        self.targetSize = targetSize
+        self.onTap = onTap
+        self.onToggleSelection = onToggleSelection
+
+        if let cached = store.cachedThumbnail(for: item.asset, targetSize: targetSize, contentMode: .aspectFill) {
+            _thumbnailState = State(initialValue: .loaded(cached))
+        } else if let preview = store.cachedPreview(for: item.asset) {
+            _thumbnailState = State(initialValue: .loaded(preview))
+        } else {
+            _thumbnailState = State(initialValue: .loading)
+        }
     }
 
     var body: some View {
@@ -150,12 +291,12 @@ private struct LivePhotoGridCell: View {
                     total: totalCount,
                     isSelected: isSelected
                 ),
-                accessibilityHintText: "Double tap to start swiping from this photo. Long press to preview.",
+                accessibilityHintText: "Double tap to preview. Use the selection circle to add this photo to a batch.",
                 onTap: {
                     store.rememberPreview(thumbnailState.image, for: item.asset)
                     onTap()
                 },
-                onRetry: thumbnailState.isFailed ? { Task { await loadThumbnail(forceLoading: true) } } : nil
+                onRetry: thumbnailState.isFailed ? { retryAttempt += 1 } : nil
             )
 
             Button(action: onToggleSelection) {
@@ -165,37 +306,46 @@ private struct LivePhotoGridCell: View {
                     .foregroundStyle(.white, isSelected ? Color.accentColor : Color.white)
                     .background(.black.opacity(0.55), in: Circle())
                     .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .zIndex(1)
             .accessibilityLabel(isSelected ? "Deselect photo" : "Select photo")
         }
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.35).onEnded { _ in
-                onLongPress()
-            }
-        )
-        .accessibilityAction(named: "Preview Live Photo") {
-            onLongPress()
-        }
-        .task(id: item.id) {
-            await loadThumbnail(forceLoading: thumbnailState.image == nil)
+        .task(id: "\(item.id)-\(item.asset.modificationDate?.timeIntervalSince1970 ?? 0)-\(targetSize.width)-\(retryAttempt)") {
+            let isForcedRetry = retryAttempt > performedRetryAttempt
+            performedRetryAttempt = retryAttempt
+            await loadThumbnail(forceRetry: isForcedRetry)
         }
     }
 
-    private func loadThumbnail(forceLoading: Bool) async {
+    private func loadThumbnail(forceRetry: Bool = false) async {
         loadToken += 1
         let token = loadToken
-        if forceLoading {
+        if thumbnailState.image == nil {
             thumbnailState = .loading
         }
 
         let events = store.imageEvents(
             for: item.asset,
-            targetSize: targetSize
+            targetSize: targetSize,
+            forceRetry: forceRetry
         )
         for await event in events {
             guard !Task.isCancelled, token == loadToken else { return }
             thumbnailState = thumbnailState.applying(event)
         }
     }
+}
+
+private struct AlbumCellFramesKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private final class CellFrameStore: @unchecked Sendable {
+    var frames: [String: CGRect] = [:]
 }

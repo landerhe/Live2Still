@@ -28,7 +28,13 @@ enum ThumbnailDisplayState {
 
     func applying(_ event: ThumbnailImageEvent) -> ThumbnailDisplayState {
         switch event {
-        case .image(let image, _): return .loaded(image)
+        case .image(let candidate, let isFinal):
+            if !isFinal, let current = image,
+               current.size.width * current.size.height * current.scale * current.scale >
+                candidate.size.width * candidate.size.height * candidate.scale * candidate.scale {
+                return self
+            }
+            return .loaded(candidate)
         case .failed: return image == nil ? .failed : self
         case .unavailable: return image == nil ? .unavailable : self
         }

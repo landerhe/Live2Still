@@ -37,7 +37,6 @@ enum LivePhotoDesign {
     static let launchHorizontalPadding: CGFloat = 24
     static let launchVerticalSpacing: CGFloat = 20
     static let launchIconSize: CGFloat = 56
-    static let welcomeOnboardingKey = "hasCompletedWelcomeOnboarding"
     static let showCloudPhotosKey = "showCloudPhotos"
     static let analyzeCloudPhotosKey = "analyzeCloudPhotos"
     static let removeOriginalKey = "removeOriginalLivePhoto"

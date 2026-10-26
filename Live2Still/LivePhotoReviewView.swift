@@ -20,6 +20,8 @@ struct LivePhotoReviewView: View {
     @State private var prefetchAssets: [PHAsset] = []
     @State private var prefetchTargetSize: CGSize = .zero
     @State private var reviewActionHapticTrigger = 0
+    @State private var noNextBatch = false
+    @State private var containerWidth: CGFloat = 390
 
     private let reviewThumbnailContentMode: PHImageContentMode = .aspectFit
 
@@ -35,23 +37,30 @@ struct LivePhotoReviewView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear {
-            onStartIfNeeded()
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear {
+                        containerWidth = geometry.size.width
+                        prefetchUpcoming()
+                    }
+                    .onChange(of: geometry.size.width) { _, width in
+                        containerWidth = width
+                        prefetchUpcoming()
+                    }
+            }
         }
+        .onAppear { onStartIfNeeded() }
+        .onChange(of: store.libraryRevision) { _, _ in noNextBatch = false }
     }
 
     // MARK: - Active review
 
-    @AppStorage("hasSeenSwipeOnboarding") private var hasSeenSwipeOnboarding = false
     @State private var showSwipeOnboardingTip = false
 
     private var activeReviewView: some View {
         VStack(spacing: 0) {
-            if showSwipeOnboardingTip {
-                swipeOnboardingTip
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 8)
-            }
+            reviewHeader
 
             LivePhotoCardStack(
                 store: store,
@@ -61,45 +70,26 @@ struct LivePhotoReviewView: View {
                 onDelete: { session.recordDelete() },
                 onKeep: { session.recordKeep() }
             )
+            .disabled(isQueueProcessing)
             .padding(.horizontal, 20)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            if session.reviewedCount == 0 {
-                swipeGestureLegend
-                    .padding(.horizontal, 20)
-                    .padding(.top, 8)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-            }
+            swipeGestureLegend
+                .padding(.horizontal, 20)
+                .padding(.top, 8)
+                .opacity(session.reviewedCount == 0 ? 1 : 0)
+                .accessibilityHidden(session.reviewedCount != 0)
+
         }
         .animation(.easeOut(duration: 0.2), value: session.reviewedCount)
         .safeAreaInset(edge: .bottom, spacing: 0) {
             reviewActionRow
                 .padding(.bottom, 8)
         }
-        .toolbar {
-            ToolbarItemGroup(placement: .topBarTrailing) {
-                if session.canUndo {
-                    Button {
-                        _ = session.undoLastAction()
-                    } label: {
-                        Image(systemName: "arrow.uturn.backward")
-                    }
-                    .accessibilityLabel("Previous photo")
-                    .disabled(isQueueProcessing)
-                }
-
-                Button {
-                    showSwipeOnboardingTip = true
-                } label: {
-                    Image(systemName: "questionmark.circle")
-                }
-                .accessibilityLabel("Swipe help")
-            }
-        }
-        .onAppear {
-            if !hasSeenSwipeOnboarding {
-                showSwipeOnboardingTip = true
-            }
+        .alert("Review gestures", isPresented: $showSwipeOnboardingTip) {
+            Button("Done", role: .cancel) {}
+        } message: {
+            Text("Swipe left for a still, right to keep the Live Photo, or down to queue deletion. Hold the photo to play its motion. Changes are applied only when you confirm the queue.")
         }
         .onChange(of: session.index) { _, _ in
             prefetchUpcoming()
@@ -110,6 +100,38 @@ struct LivePhotoReviewView: View {
         .onDisappear {
             stopPrefetch()
         }
+    }
+
+    private var reviewHeader: some View {
+        HStack(spacing: 8) {
+            Text("\(session.reviewedCount + 1) of \(session.totalCount)")
+                .font(.subheadline.weight(.medium).monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Button {
+                _ = session.undoLastAction()
+            } label: {
+                Label("Undo", systemImage: "arrow.uturn.backward")
+                    .labelStyle(.iconOnly)
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(.plain)
+            .disabled(!session.canUndo || isQueueProcessing)
+            .accessibilityLabel("Previous photo")
+
+            Button {
+                showSwipeOnboardingTip = true
+            } label: {
+                Image(systemName: "questionmark.circle")
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Swipe help")
+        }
+        .padding(.horizontal, 20)
+        .padding(.bottom, 4)
     }
 
     private var reviewActionRow: some View {
@@ -134,7 +156,7 @@ struct LivePhotoReviewView: View {
             reviewActionButton(title: "Delete", systemImage: "trash", tint: .red) {
                 performReviewAction { session.recordDelete() }
             }
-            reviewActionButton(title: "Keep Live", systemImage: "livephoto", tint: nil) {
+            reviewActionButton(title: "Keep", systemImage: "livephoto", tint: nil) {
                 performReviewAction { session.recordKeep() }
             }
         }
@@ -153,6 +175,8 @@ struct LivePhotoReviewView: View {
         }
         .buttonStyle(.glass)
         .tint(tint)
+        .disabled(isQueueProcessing)
+        .accessibilityLabel(title == "Keep" ? "Keep Live Photo" : title)
     }
 
     private func performReviewAction(_ action: () -> Void) {
@@ -179,29 +203,10 @@ struct LivePhotoReviewView: View {
             .foregroundStyle(tint)
     }
 
-    private var swipeOnboardingTip: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Swipe to sort your Live Photos")
-                .font(.subheadline.weight(.semibold))
-            Text("Swipe left to queue a still, right to keep, and down to queue delete. Press and hold a card to preview motion. Use the buttons below if you prefer.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Button("Got it") {
-                hasSeenSwipeOnboarding = true
-                showSwipeOnboardingTip = false
-            }
-            .buttonStyle(.glassProminent)
-            .frame(maxWidth: .infinity, alignment: .trailing)
-        }
-        .padding(14)
-        .glassEffect(in: .rect(cornerRadius: 14))
-        .accessibilityElement(children: .combine)
-    }
-
     private func prefetchUpcoming() {
         let container = LivePhotoThumbnailSizing.cardContainerSize(
             in: CGSize(
-                width: max(1, reviewPrefetchAvailableWidth - 40),
+                width: max(1, containerWidth - 40),
                 height: LivePhotoDesign.swipeCardMaxHeight
             ),
             horizontalPadding: 0
@@ -215,23 +220,36 @@ struct LivePhotoReviewView: View {
             session.deck[$0].asset
         }
 
-        if !prefetchAssets.isEmpty, prefetchTargetSize != .zero {
+        if prefetchTargetSize == targetSize {
+            let oldIDs = Set(prefetchAssets.map(\.localIdentifier))
+            let newIDs = Set(upcoming.map(\.localIdentifier))
             store.stopCaching(
-                assets: prefetchAssets,
-                targetSize: prefetchTargetSize,
+                assets: prefetchAssets.filter { !newIDs.contains($0.localIdentifier) },
+                targetSize: targetSize,
+                contentMode: reviewThumbnailContentMode
+            )
+            store.startCaching(
+                assets: upcoming.filter { !oldIDs.contains($0.localIdentifier) },
+                targetSize: targetSize,
+                contentMode: reviewThumbnailContentMode
+            )
+        } else {
+            if !prefetchAssets.isEmpty, prefetchTargetSize != .zero {
+                store.stopCaching(
+                    assets: prefetchAssets,
+                    targetSize: prefetchTargetSize,
+                    contentMode: reviewThumbnailContentMode
+                )
+            }
+            store.startCaching(
+                assets: upcoming,
+                targetSize: targetSize,
                 contentMode: reviewThumbnailContentMode
             )
         }
 
         prefetchAssets = upcoming
         prefetchTargetSize = targetSize
-
-        guard !upcoming.isEmpty else { return }
-        store.startCaching(
-            assets: upcoming,
-            targetSize: targetSize,
-            contentMode: reviewThumbnailContentMode
-        )
     }
 
     private func stopPrefetch() {
@@ -245,20 +263,14 @@ struct LivePhotoReviewView: View {
         prefetchTargetSize = .zero
     }
 
-    private var reviewPrefetchAvailableWidth: CGFloat {
-        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene {
-            return windowScene.screen.bounds.width
-        }
-        return 390
-    }
-
     // MARK: - Finished
 
     private var finishedView: some View {
         ContentUnavailableView {
-            Label("All Done", systemImage: "checkmark.circle")
+            Label("Batch Complete", systemImage: "checkmark.circle")
         } description: {
             VStack(spacing: 6) {
+                if noNextBatch { Text("No additional accessible Live Photos to review.") }
                 Text("Kept \(session.keptCount) Live Photo\(session.keptCount == 1 ? "" : "s").")
                 if !session.hasQueuedActions {
                     Text("Nothing queued for batch actions.")
@@ -279,15 +291,19 @@ struct LivePhotoReviewView: View {
                 }
                 .buttonStyle(.glassProminent)
             }
-            Button("Swipe Again") {
-                session.startNewDeckPreservingQueue(
-                    deck: store.makeReviewDeck(
-                        maxCount: LivePhotoDesign.reviewDeckMaxCount,
-                        order: reviewOrder
-                    )
-                )
+            Button("Continue Next Batch") {
+                let next = store.makeReviewDeck(maxCount: LivePhotoDesign.reviewDeckMaxCount,
+                                                order: reviewOrder, excludingIDs: session.reviewedIDs)
+                if !next.isEmpty { session.startNewDeckPreservingQueue(deck: next) }
+                else { noNextBatch = true }
             }
             .buttonStyle(.glass)
+            .disabled(isQueueProcessing)
+            Button("Review Again") {
+                session.startNewDeckPreservingQueue(deck: store.makeReviewDeck(
+                    maxCount: LivePhotoDesign.reviewDeckMaxCount, order: reviewOrder))
+            }.buttonStyle(.glass).disabled(isQueueProcessing)
+
         }
     }
 }
@@ -311,12 +327,13 @@ private struct LivePhotoCardStack: View {
 
     @Environment(\.displayScale) private var displayScale
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @GestureState private var gestureActive = false
     @State private var dragOffset: CGSize = .zero
     @State private var isAdvancing = false
     @State private var swipeHapticTrigger = 0
     @State private var livePreviewHapticTrigger = 0
     @State private var touchPhase: CardTouchPhase = .idle
-    @State private var pressStartedAt: Date?
+    @State private var pendingLivePressTask: Task<Void, Never>?
     @State private var isPressingLive = false
     @State private var departingItem: LivePhotoItem?
     @State private var departingOffset: CGSize = .zero
@@ -335,12 +352,12 @@ private struct LivePhotoCardStack: View {
             )
 
             ZStack {
-                ForEach(visibleCardIndices.reversed(), id: \.self) { offset in
-                    let item = deck[index + offset]
+                ForEach(visibleCards.reversed(), id: \.item.id) { card in
+                    let offset = card.offset
+                    let item = card.item
                     let isTop = offset == 0
 
                     cardContent(item: item, containerSize: containerSize, isTop: isTop)
-                        .id(item.id)
                         .scaleEffect(scale(forStackOffset: offset))
                         .offset(y: yOffset(forStackOffset: offset))
                         .offset(isTop ? dragOffset : .zero)
@@ -378,8 +395,13 @@ private struct LivePhotoCardStack: View {
         .frame(maxHeight: LivePhotoDesign.swipeCardMaxHeight)
         .livePhotoImpactFeedback(trigger: swipeHapticTrigger)
         .livePhotoRigidImpactFeedback(trigger: livePreviewHapticTrigger)
-        .onChange(of: index) { _, _ in
-            resetTouchState()
+        .onChange(of: index) { _, _ in resetTouchState() }
+        .onChange(of: gestureActive) { _, active in
+            if !active && !isAdvancing { resetTouchState() }
+        }
+        .onDisappear {
+            pendingLivePressTask?.cancel()
+            pendingLivePressTask = nil
         }
     }
 
@@ -391,9 +413,9 @@ private struct LivePhotoCardStack: View {
         }
     }
 
-    private var visibleCardIndices: [Int] {
-        let remaining = deck.count - index
-        return Array(0 ..< min(3, remaining))
+    private var visibleCards: [(offset: Int, item: LivePhotoItem)] {
+        guard index < deck.count else { return [] }
+        return (0..<min(3, deck.count - index)).map { ($0, deck[index + $0]) }
     }
 
     private var cardRotation: Angle {
@@ -454,6 +476,7 @@ private struct LivePhotoCardStack: View {
 
     private var cardTouchGesture: some Gesture {
         DragGesture(minimumDistance: 0)
+            .updating($gestureActive) { _, active, _ in active = true }
             .onChanged { value in
                 handleDragChanged(translation: value.translation)
             }
@@ -470,15 +493,19 @@ private struct LivePhotoCardStack: View {
         switch touchPhase {
         case .idle:
             touchPhase = .pendingPress
-            pressStartedAt = Date()
+            pendingLivePressTask?.cancel()
+            pendingLivePressTask = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(LivePhotoDesign.livePressMinimumDuration))
+                guard !Task.isCancelled, touchPhase == .pendingPress else { return }
+                beginLivePreviewIfNeeded()
+            }
 
         case .pendingPress:
             if distance >= LivePhotoDesign.swipeDragMinimumDistance {
                 beginSwiping(translation: translation)
-            } else if distance <= LivePhotoDesign.livePressMaximumMovement,
-                      let pressStartedAt,
-                      Date().timeIntervalSince(pressStartedAt) >= LivePhotoDesign.livePressMinimumDuration {
-                beginLivePreviewIfNeeded()
+            } else if distance > LivePhotoDesign.livePressMaximumMovement {
+                pendingLivePressTask?.cancel()
+                pendingLivePressTask = nil
             }
 
         case .playingLive:
@@ -518,6 +545,8 @@ private struct LivePhotoCardStack: View {
     }
 
     private func beginSwiping(translation: CGSize) {
+        pendingLivePressTask?.cancel()
+        pendingLivePressTask = nil
         touchPhase = .swiping
         isPressingLive = false
         dragOffset = translation
@@ -531,8 +560,9 @@ private struct LivePhotoCardStack: View {
     }
 
     private func resetTouchState() {
+        pendingLivePressTask?.cancel()
+        pendingLivePressTask = nil
         touchPhase = .idle
-        pressStartedAt = nil
         isPressingLive = false
         dragOffset = .zero
     }
@@ -574,7 +604,8 @@ private struct LivePhotoCardStack: View {
         swipeHapticTrigger += 1
         stopLivePreview()
         touchPhase = .idle
-        pressStartedAt = nil
+        pendingLivePressTask?.cancel()
+        pendingLivePressTask = nil
         dragOffset = .zero
 
         var advanceTransaction = Transaction()
@@ -634,23 +665,26 @@ private struct SwipeOverlayLabel: View {
     let opacity: Double
 
     var body: some View {
-        ZStack(alignment: alignment) {
-            Color.clear
-            VStack(spacing: 4) {
-                Image(systemName: systemImage)
-                    .font(.title2.weight(.bold))
-                Text(text)
-                    .font(.headline.weight(.bold))
+        if opacity > 0 {
+            ZStack(alignment: alignment) {
+                Color.clear
+                VStack(spacing: 4) {
+                    Image(systemName: systemImage)
+                        .font(.title2.weight(.bold))
+                    Text(text)
+                        .font(.headline.weight(.bold))
+                }
+                .foregroundStyle(tint)
+                .padding(12)
+                .glassEffect(in: .rect(cornerRadius: LivePhotoDesign.swipeBadgeCornerRadius))
+                .overlay(
+                    RoundedRectangle(cornerRadius: LivePhotoDesign.swipeBadgeCornerRadius, style: .continuous)
+                        .strokeBorder(tint.opacity(0.85), lineWidth: 2)
+                )
+                .padding(20)
+                .opacity(opacity)
             }
-            .foregroundStyle(tint)
-            .padding(12)
-            .glassEffect(in: .rect(cornerRadius: LivePhotoDesign.swipeBadgeCornerRadius))
-            .overlay(
-                RoundedRectangle(cornerRadius: LivePhotoDesign.swipeBadgeCornerRadius, style: .continuous)
-                    .strokeBorder(tint.opacity(0.85), lineWidth: 2)
-            )
-            .padding(20)
-            .opacity(opacity)
+            .allowsHitTesting(false)
         }
     }
 }
@@ -662,8 +696,37 @@ struct LivePhotoCardImage: View {
     var displayScale: CGFloat = 2
     var quality: LivePhotoThumbnailSizing.Quality = .full
 
-    @State private var thumbnailState: ThumbnailDisplayState = .loading
+    @State private var thumbnailState: ThumbnailDisplayState
+    @State private var retryAttempt = 0
+    @State private var performedRetryAttempt = 0
     @State private var loadToken = 0
+
+    init(
+        item: LivePhotoItem,
+        store: LivePhotoLibraryStore,
+        containerSize: CGSize = CGSize(width: 300, height: 400),
+        displayScale: CGFloat = 2,
+        quality: LivePhotoThumbnailSizing.Quality = .full
+    ) {
+        self.item = item
+        self.store = store
+        self.containerSize = containerSize
+        self.displayScale = displayScale
+        self.quality = quality
+
+        let target = LivePhotoThumbnailSizing.targetSize(
+            container: containerSize,
+            displayScale: displayScale,
+            quality: quality
+        )
+        if let cached = store.cachedThumbnail(for: item.asset, targetSize: target, contentMode: .aspectFit) {
+            _thumbnailState = State(initialValue: .loaded(cached))
+        } else if let preview = store.cachedPreview(for: item.asset) {
+            _thumbnailState = State(initialValue: .loaded(preview))
+        } else {
+            _thumbnailState = State(initialValue: .loading)
+        }
+    }
 
     private var targetSize: CGSize {
         LivePhotoThumbnailSizing.targetSize(
@@ -693,7 +756,7 @@ struct LivePhotoCardImage: View {
                         .font(.largeTitle)
                         .foregroundStyle(.secondary)
                     Button("Retry") {
-                        Task { await loadThumbnail() }
+                        retryAttempt += 1
                     }
                     .font(.caption.weight(.medium))
                     .buttonStyle(.plain)
@@ -702,12 +765,14 @@ struct LivePhotoCardImage: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .task(id: "\(item.id)-\(quality)-\(Int(targetSize.width))x\(Int(targetSize.height))") {
-            await loadThumbnail()
+        .task(id: "\(item.id)-\(item.asset.modificationDate?.timeIntervalSince1970 ?? 0)-\(quality)-\(Int(targetSize.width))x\(Int(targetSize.height))-\(retryAttempt)") {
+            let isForcedRetry = retryAttempt > performedRetryAttempt
+            performedRetryAttempt = retryAttempt
+            await loadThumbnail(forceRetry: isForcedRetry)
         }
     }
 
-    private func loadThumbnail() async {
+    private func loadThumbnail(forceRetry: Bool = false) async {
         loadToken += 1
         let token = loadToken
         if thumbnailState.image == nil {
@@ -717,7 +782,8 @@ struct LivePhotoCardImage: View {
         let events = store.imageEvents(
             for: item.asset,
             targetSize: targetSize,
-            contentMode: .aspectFit
+            contentMode: .aspectFit,
+            forceRetry: forceRetry
         )
         for await event in events {
             guard !Task.isCancelled, token == loadToken else { return }

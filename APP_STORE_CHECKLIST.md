@@ -14,7 +14,7 @@ Suggested placeholders currently in code:
 - Privacy: `https://live2still.app/privacy`
 - Support: `mailto:support@live2still.app`
 
-Replace both with real destinations before review.
+地址与邮箱按用户 2026-10-04 的要求暂不修改；在最后的上架准备阶段确认所有权、公开可访问性与收信能力。
 
 ## 2. App information
 
@@ -47,13 +47,13 @@ Do not show developer-only copy.
 
 **Description**
 
-Live2Still turns Live Photos into still images so you can free storage without leaving your library.
+Live2Still saves still copies of the current appearance of your Live Photos, with a batch review workflow in your photo library.
 
 • Browse Live Photos in Album and convert the ones you choose  
 • Swipe to queue stills or deletes, then Apply when ready  
 • Optionally remove the original Live Photo after conversion  
 • Works offline with photos stored on this device  
-• Processing stays on your iPhone — nothing is uploaded  
+• Processing stays on your iPhone; cloud photos may download through Apple iCloud Photos
 
 Requires iOS 26.
 
@@ -63,7 +63,7 @@ live photo,still,storage,convert,clean,library,photos,free space
 
 **What’s New (1.0)**
 
-First release: convert Live Photos to stills, swipe review queue, and optional original removal.
+First release: batch Live Photo conversion, persistent review queues, verified copies, and optional original removal.
 
 ## 6. Review notes
 
@@ -73,7 +73,7 @@ Paste something like:
 Demo steps:
 1. Open Camera → enable Live → take one Live Photo.
 2. Open Live2Still → allow Photos access (Limited or Full both work).
-3. Album: select the photo → leave “Remove original” visible on the bottom bar → Convert.
+3. Choose Keep Originals on first use. Album: select the photo → Convert. Review Last Conversion from Settings.
 4. Swipe tab: swipe left = still, right = keep, down = delete; Undo is in the toolbar; open Queue → Apply.
 
 No account. No network required except for iCloud-only photos.
@@ -86,4 +86,8 @@ Binary sets `ITSAppUsesNonExemptEncryption = NO`. In Connect, confirm the app on
 
 ## 8. Final device QA
 
-Run `scripts/qa-verification.sh` on a physical iPhone with Live Photos before archive.
+Run `scripts/qa-verification.sh` on a physical iPhone with dedicated Live Photo copies before archive.
+
+2026-10-04 修复验证：队列保存、Keep/Undo、统一操作锁、分块转换、当前外观导出、元数据验证、取消和结果恢复已加入代码。具体通过与未通过的测试以 `REPAIR_STATUS.md` 为准。
+
+必须完成：编辑／关键照片／iCloud 样本，有限及撤销权限，低磁盘空间，转换中退出／强制终止，VoiceOver 与大字号。仅使用专用测试副本进行删除验证。Recently Deleted 与 iCloud 同步期间不要宣称立即释放固定容量。

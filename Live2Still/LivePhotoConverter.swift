@@ -18,6 +18,26 @@ enum LivePhotoError: LocalizedError {
     case batchPartialFailure(succeeded: Int, failed: Int)
     case alreadyConverting
     case savedStillNotVerifiable
+    case insufficientStorage
+    case resourceTimedOut
+    case currentImageUnavailable
+    case metadataNotPreserved
+    case outputDidNotMatch
+    case sourceChanged
+    case networkAccessRequired
+
+    nonisolated static func resourceFailure(_ error: Error) -> Error {
+        var current = error as NSError
+        for _ in 0..<8 {
+            if current.domain == PHPhotosErrorDomain,
+               current.code == PHPhotosError.Code.networkAccessRequired.rawValue {
+                return LivePhotoError.networkAccessRequired
+            }
+            guard let underlying = current.userInfo[NSUnderlyingErrorKey] as? NSError else { break }
+            current = underlying
+        }
+        return error
+    }
 
     var errorDescription: String? {
         switch self {
@@ -36,7 +56,21 @@ enum LivePhotoError: LocalizedError {
         case .alreadyConverting:
             "A conversion is already in progress."
         case .savedStillNotVerifiable:
-            "A still was previously saved, but Photos cannot verify it. Keep the original and review this photo in Photos."
+            "Photos could not verify an earlier saved copy. Originals were kept. Retry later, or explicitly save fresh copies while keeping originals."
+        case .insufficientStorage:
+            "Not enough working space. Free at least 64 MB before saving copies. Originals were kept."
+        case .resourceTimedOut:
+            "Photos did not finish loading this image. Originals were kept; try again."
+        case .currentImageUnavailable:
+            "Photos could not provide the current edited image. Originals were kept."
+        case .metadataNotPreserved:
+            "A copy was saved, but its date, location, favorites, hidden status, or albums could not be verified. The original was kept."
+        case .outputDidNotMatch:
+            "The saved copy did not match the current photo. The original was kept."
+        case .sourceChanged:
+            "This photo changed during conversion. The original was kept; review it again."
+        case .networkAccessRequired:
+            "The full photo is not on this device. A cached preview is not enough to convert it. No download was requested and the original was kept."
         }
     }
 }
@@ -48,345 +82,406 @@ struct BatchConversionResult: Sendable {
     let convertedSourceIDs: [String]
     let originalsRemovedSourceIDs: [String]
     let retainedSourceIDs: [String]
-    /// Source IDs that failed during prepare (safe to retry).
     let failedSourceIDs: [String]
-    /// True when stills were created but the user canceled (or delete failed) removing originals.
     let originalsRemovalCanceled: Bool
-    /// Total bytes freed when originals were removed; nil if originals were kept.
     let bytesSaved: Int64?
     let bytesSavedIsEstimate: Bool
+    let failureMessages: [String: String]
+
+    var summary: String {
+        var text = "Saved and image-verified still copies for \(succeeded) photo\(succeeded == 1 ? "" : "s")."
+        if !originalsRemovedSourceIDs.isEmpty {
+            text += " \(originalsRemovedSourceIDs.count) original(s) moved to Recently Deleted. Space may not be reclaimed yet."
+        } else { text += " Originals were kept." }
+        if !retainedSourceIDs.isEmpty {
+            text += " \(retainedSourceIDs.count) requested removal(s) were not completed."
+        }
+        if failed > 0 { text += " \(failed) photo(s) need attention." }
+        let reasons = Array(Set(failureMessages.values)).sorted()
+        if !reasons.isEmpty { text += "\n\n" + reasons.prefix(3).joined(separator: "\n\n") }
+        return text
+    }
 }
 
-private struct PreparedConversion {
+nonisolated private struct PreparedConversion: Sendable {
     let sourceAsset: PHAsset
-    let fileURL: URL
+    let file: PhotoResourceFile
     let collectionIDs: [String]
     let isFavorite: Bool
     let isHidden: Bool
-    let savedBytes: Int64
-    let savedBytesIsEstimate: Bool
-    var placeholderLocalIdentifier: String?
+    let sourceVersion: TimeInterval
+    let originalFilename: String?
+    var outputID: String?
 }
 
 @MainActor
 @Observable
 final class LivePhotoConverter {
-    private static let prepareConcurrency = 3
-
+    static let shared = LivePhotoConverter()
+    private static let chunkSize = 8
+    private static let prepareConcurrency = 2
     private(set) var isConverting = false
     private(set) var isSaving = false
     private(set) var conversionProgress: (completed: Int, total: Int)?
-
+    private(set) var stageMessage = ""
+    private(set) var lastSummary = UserDefaults.standard.string(forKey: "lastConversionSummary")
+    private(set) var lastFailureMessages: [String: String] = (UserDefaults.standard.dictionary(forKey: "lastConversionFailures") as? [String: String]) ?? [:]
     private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    private var activeTask: Task<BatchConversionResult, Error>?
+
+    func cancel() {
+        PhotoOperationCoordinator.shared.cancel()
+        activeTask?.cancel()
+        stageMessage = "Stopping after the current Photos transaction…"
+    }
 
     func convert(
-        assets: [PHAsset],
-        removeOriginal: Bool,
+        assets: [PHAsset], removeOriginal: Bool,
+        allowNetwork: Bool = false,
+        allowUnverifiedCopy: Bool = false,
+        operationID: UUID? = nil,
         progress: ((Int, Int) -> Void)? = nil
     ) async throws -> BatchConversionResult {
-        guard !isConverting else {
-            throw LivePhotoError.alreadyConverting
-        }
-
-        guard !assets.isEmpty else {
-            return BatchConversionResult(
-                succeeded: 0,
-                failed: 0,
-                errors: [],
-                convertedSourceIDs: [],
-                originalsRemovedSourceIDs: [],
-                retainedSourceIDs: [],
-                failedSourceIDs: [],
-                originalsRemovalCanceled: false,
-                bytesSaved: nil,
-                bytesSavedIsEstimate: false
-            )
-        }
-
-        let totalPhotos = max(assets.count, 1)
-        let ledger = UserDefaults.standard.dictionary(forKey: "createdStillBySource") as? [String: String] ?? [:]
-        let trackedAssets = assets.filter { ledger[$0.localIdentifier] != nil }
-        let createdIDs = trackedAssets.compactMap { ledger[$0.localIdentifier] }.filter { !$0.isEmpty }
-        let createdFetch = PHAsset.fetchAssets(withLocalIdentifiers: createdIDs, options: nil)
-        var verifiedStillIDs: Set<String> = []
-        createdFetch.enumerateObjects { asset, _, _ in verifiedStillIDs.insert(asset.localIdentifier) }
-        let alreadyConverted = trackedAssets.filter {
-            guard let createdID = ledger[$0.localIdentifier] else { return false }
-            return verifiedStillIDs.contains(createdID)
-        }
-        let unverifiedSourceIDs = trackedAssets.map(\.localIdentifier)
-            .filter { id in !alreadyConverted.contains(where: { $0.localIdentifier == id }) }
-        let newAssets = assets.filter { ledger[$0.localIdentifier] == nil }
-
+        guard !isConverting else { throw LivePhotoError.alreadyConverting }
+        let lease = try PhotoOperationCoordinator.shared.claim(parentID: operationID)
+        defer { if lease.ownsLease { PhotoOperationCoordinator.shared.end(lease.id) } }
+        guard !PhotoOperationCoordinator.shared.isCancellationRequested else { throw CancellationError() }
         isConverting = true
-        isSaving = false
         beginBackgroundTaskIfNeeded()
-        reportProgress(completed: 0, total: totalPhotos, callback: progress)
         defer {
             isConverting = false
             isSaving = false
             conversionProgress = nil
+            activeTask = nil
             endBackgroundTaskIfNeeded()
         }
-
-        let prepareOutcome = await prepareAssets(newAssets, totalPhotos: totalPhotos, progress: progress)
-        let prepared = prepareOutcome.prepared
-        let prepareFailed = prepareOutcome.failed + unverifiedSourceIDs.count
-        let prepareErrors = prepareOutcome.errors + unverifiedSourceIDs.map { _ in LivePhotoError.savedStillNotVerifiable }
-        let failedSourceIDs = prepareOutcome.failedSourceIDs + unverifiedSourceIDs
-
-        guard !prepared.isEmpty || !alreadyConverted.isEmpty else {
-            throw prepareErrors.first ?? LivePhotoError.conversionFailed(underlying: nil)
+        do {
+            // This directory is exclusively owned while the mutation lease is held.
+            try await Task.detached { try PhotoResourceIO.cleanAbandonedFiles() }.value
+            let task = Task {
+                try await runConversion(assets: assets, removeOriginal: removeOriginal,
+                                        allowNetwork: allowNetwork, allowUnverifiedCopy: allowUnverifiedCopy, progress: progress)
+            }
+            activeTask = task
+            let result = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+            recordLastResult(summary: result.summary, failures: result.failureMessages)
+            return result
+        } catch {
+            let reason = error is CancellationError ? "Stopped safely. Originals were kept." : error.localizedDescription
+            recordLastResult(summary: "Conversion could not finish. Originals were kept.\n\n" + reason,
+                             failures: Dictionary(assets.map { ($0.localIdentifier, reason) }, uniquingKeysWith: { first, _ in first }))
+            throw error
         }
+    }
 
-        isSaving = true
-        reportProgress(completed: totalPhotos, total: totalPhotos, callback: progress)
+    private func recordLastResult(summary: String, failures: [String: String]) {
+        lastSummary = summary
+        lastFailureMessages = failures
+        UserDefaults.standard.set(summary, forKey: "lastConversionSummary")
+        UserDefaults.standard.set(failures, forKey: "lastConversionFailures")
+    }
 
-        var committed: [PreparedConversion] = []
-        if !prepared.isEmpty {
+    private func runConversion(
+        assets: [PHAsset], removeOriginal: Bool, allowNetwork: Bool,
+        allowUnverifiedCopy: Bool, progress: ((Int, Int) -> Void)?
+    ) async throws -> BatchConversionResult {
+        let ordered = Dictionary(assets.map { ($0.localIdentifier, $0) }, uniquingKeysWith: { first, _ in first })
+            .values.sorted { ($0.creationDate ?? .distantPast, $0.localIdentifier) > ($1.creationDate ?? .distantPast, $1.localIdentifier) }
+        // A corrupt/unwritable journal must fail closed before any Photos mutation.
+        _ = try ConversionJournal.shared.records()
+        var imageVerified: Set<String> = []
+        var verified: Set<String> = []
+        var removed: Set<String> = []
+        var failures: [String: String] = [:]
+        var errors: [Error] = []
+        var completed = 0
+        // Retain identifiers and digests, never image data or working files, across chunks.
+        var removalCandidates: [PreparedConversion] = []
+        reportProgress(0, total: ordered.count, progress)
+        for start in stride(from: 0, to: ordered.count, by: Self.chunkSize) {
+            if Task.isCancelled || PhotoOperationCoordinator.shared.isCancellationRequested { break }
+            let chunk = Array(ordered[start ..< min(start + Self.chunkSize, ordered.count)])
+            stageMessage = "Loading current photos…"
+            let preparedOutcome = await prepareAssets(chunk, allowNetwork: allowNetwork)
+            var prepared = preparedOutcome.prepared
+            for (id, error) in preparedOutcome.errors {
+                failures[id] = error.localizedDescription
+                errors.append(error)
+            }
+            // Cleanup runs for preparation, journal, save, metadata, cancellation and verification errors.
             do {
-                committed = try await commitCreations(prepared: prepared)
-                var updatedLedger = ledger
-                for item in committed {
-                    updatedLedger[item.sourceAsset.localIdentifier] = item.placeholderLocalIdentifier ?? ""
+                defer { prepared.forEach { try? FileManager.default.removeItem(at: $0.file.url) } }
+                if Task.isCancelled { break }
+                let journal = try ConversionJournal.shared.records()
+                let legacy = UserDefaults.standard.dictionary(forKey: "createdStillBySource") as? [String: String] ?? [:]
+                var toCreate: [Int] = []
+                for index in prepared.indices {
+                    let id = prepared[index].sourceAsset.localIdentifier
+                    let recordedID = journal[id]?.outputID ?? legacy[id]
+                    if let recordedID, !recordedID.isEmpty {
+                        do {
+                            let output = try await confirmedAsset(recordedID)
+                            try await verifyImage(output, file: prepared[index].file)
+                            prepared[index].outputID = recordedID
+                        } catch {
+                            if allowUnverifiedCopy && !removeOriginal { toCreate.append(index) }
+                            else { failures[id] = LivePhotoError.savedStillNotVerifiable.localizedDescription; errors.append(LivePhotoError.savedStillNotVerifiable) }
+                        }
+                    } else { toCreate.append(index) }
                 }
-                UserDefaults.standard.set(updatedLedger, forKey: "createdStillBySource")
-                try? await applyBatchPostCreationMetadata(prepared: committed)
-                reportProgress(completed: totalPhotos, total: totalPhotos, callback: progress)
+                try Task.checkCancellation()
+                if !toCreate.isEmpty {
+                    isSaving = true
+                    stageMessage = "Saving still copies…"
+                    let created = try await commitCreations(toCreate.map { prepared[$0] })
+                    for (position, item) in zip(toCreate, created) { prepared[position] = item }
+                    isSaving = false
+                }
+                try Task.checkCancellation()
+                let saved = prepared.filter { $0.outputID != nil }
+                stageMessage = "Verifying saved photos and metadata…"
+                let metadataFailures = await applyMetadata(saved)
+                for (id, error) in metadataFailures { failures[id] = error.localizedDescription; errors.append(error) }
+                for item in saved {
+                    let id = item.sourceAsset.localIdentifier
+                    do {
+                        try Task.checkCancellation()
+                        guard let outputID = item.outputID else { throw LivePhotoError.savedStillNotVerifiable }
+                        let output = try await confirmedAsset(outputID)
+                        try await verifyImage(output, file: item.file)
+                        imageVerified.insert(id)
+                        guard failures[id] == nil else { continue }
+                        try verifyMetadata(output, prepared: item)
+                        try ConversionJournal.shared.update([record(item, stage: .verified)])
+                        verified.insert(id)
+                    } catch { failures[id] = error.localizedDescription; errors.append(error) }
+                }
+                try Task.checkCancellation()
+                if removeOriginal {
+                    removalCandidates.append(contentsOf: saved.filter { verified.contains($0.sourceAsset.localIdentifier) })
+                }
             } catch {
-                cleanupTemporaryFiles(prepared)
-                throw LivePhotoError.conversionFailed(underlying: error)
+                for item in chunk where !removed.contains(item.localIdentifier) && failures[item.localIdentifier] == nil {
+                    failures[item.localIdentifier] = error.localizedDescription
+                }
+                errors.append(error)
             }
+            completed += chunk.count
+            reportProgress(completed, total: ordered.count, progress)
+            if Task.isCancelled { break }
         }
-
-        var originalsRemovalCanceled = false
-        var removedIDs: Set<String> = []
-        let verifiedCreatedIDs = await Self.confirmedCreatedIDs(
-            Set(committed.compactMap(\.placeholderLocalIdentifier))
-        )
-        let convertedAssets = committed.filter {
-            guard let id = $0.placeholderLocalIdentifier else { return false }
-            return verifiedCreatedIDs.contains(id)
-        }
-            .map(\.sourceAsset) + alreadyConverted
-
-        if removeOriginal {
-            if convertedAssets.isEmpty {
-                originalsRemovalCanceled = true
-            } else {
+        // Saving remains bounded to eight files per chunk. The native removal prompt covers
+        // the entire batch once, after every eligible still copy has been verified.
+        if removeOriginal, !Task.isCancelled, !PhotoOperationCoordinator.shared.isCancellationRequested {
+            stageMessage = "Checking originals before removal…"
+            var safeSources: [PHAsset] = []
+            var safeItems: [PreparedConversion] = []
+            for item in removalCandidates {
+                if Task.isCancelled || PhotoOperationCoordinator.shared.isCancellationRequested { break }
                 do {
-                    // Transaction 2: delete originals only after stills are verified.
-                    try await deleteOriginals(assets: convertedAssets)
-                    removedIDs = await Self.confirmedRemovedIDs(Set(convertedAssets.map(\.localIdentifier)))
-                    originalsRemovalCanceled = removedIDs.count != committed.count + alreadyConverted.count
-                    var updatedLedger = UserDefaults.standard.dictionary(forKey: "createdStillBySource") as? [String: String] ?? [:]
-                    for id in removedIDs {
-                        updatedLedger.removeValue(forKey: id)
+                    let current = try await confirmedAsset(item.sourceAsset.localIdentifier)
+                    guard (current.modificationDate?.timeIntervalSince1970 ?? 0) == item.sourceVersion,
+                          current.isFavorite == item.isFavorite, current.isHidden == item.isHidden,
+                          Set(Self.albumIDs(current)) == Set(item.collectionIDs) else { throw LivePhotoError.sourceChanged }
+                    guard let outputID = item.outputID else { throw LivePhotoError.savedStillNotVerifiable }
+                    // The working file has been removed; its digest/dimensions still verify the saved resource.
+                    let output = try await confirmedAsset(outputID)
+                    try await verifyImage(output, file: item.file)
+                    try verifyMetadata(output, prepared: item)
+                    safeSources.append(current)
+                    safeItems.append(item)
+                } catch { failures[item.sourceAsset.localIdentifier] = error.localizedDescription; errors.append(error) }
+            }
+            if !safeSources.isEmpty, !Task.isCancelled, !PhotoOperationCoordinator.shared.isCancellationRequested {
+                stageMessage = "Requesting original removal…"
+                do {
+                    // A submitted Photos transaction cannot be undone by Stop.
+                    try await PHPhotoLibrary.shared().performChanges { PHAssetChangeRequest.deleteAssets(safeSources as NSArray) }
+                    let deleted = await confirmedRemovedIDs(Set(safeSources.map(\.localIdentifier)))
+                    removed.formUnion(deleted)
+                    PhotoOperationCoordinator.shared.recordRemoval(deleted)
+                    try ConversionJournal.shared.update(safeItems.filter { deleted.contains($0.sourceAsset.localIdentifier) }
+                        .map { record($0, stage: .removed) })
+                    for source in safeSources where !deleted.contains(source.localIdentifier) {
+                        failures[source.localIdentifier] = "The still is verified, but the original was not removed. It remains safe to retry."
                     }
-                    UserDefaults.standard.set(updatedLedger, forKey: "createdStillBySource")
                 } catch {
-                    originalsRemovalCanceled = true
+                    for source in safeSources { failures[source.localIdentifier] = error.localizedDescription }
+                    errors.append(error)
                 }
             }
         }
-
-        cleanupTemporaryFiles(prepared)
-
-        let succeeded = committed.count + alreadyConverted.count
-        let failed = prepareFailed
-
-        if failed > 0, succeeded == 0 {
-            throw prepareErrors.first ?? LivePhotoError.conversionFailed(underlying: nil)
+        let requested = Set(ordered.map(\.localIdentifier))
+        let successful = removeOriginal ? removed : verified.subtracting(failures.keys)
+        for id in requested.subtracting(successful) where failures[id] == nil {
+            failures[id] = "Stopped before this change completed. Originals were kept; Apply can retry."
         }
-
-        let bytesSaved: Int64?
-        let bytesSavedIsEstimate: Bool
-        if !removedIDs.isEmpty {
-            bytesSaved = committed.filter { removedIDs.contains($0.sourceAsset.localIdentifier) }
-                .reduce(0) { $0 + $1.savedBytes }
-            bytesSavedIsEstimate = committed.contains {
-                removedIDs.contains($0.sourceAsset.localIdentifier) && $0.savedBytesIsEstimate
-            }
-        } else {
-            bytesSaved = nil
-            bytesSavedIsEstimate = false
-        }
-
         return BatchConversionResult(
-            succeeded: succeeded,
-            failed: failed,
-            errors: prepareErrors,
-            convertedSourceIDs: committed.map(\.sourceAsset.localIdentifier) + alreadyConverted.map(\.localIdentifier),
-            originalsRemovedSourceIDs: Array(removedIDs),
-            retainedSourceIDs: (committed.map(\.sourceAsset) + alreadyConverted)
-                .map(\.localIdentifier).filter { !removedIDs.contains($0) },
-            failedSourceIDs: failedSourceIDs,
-            originalsRemovalCanceled: originalsRemovalCanceled,
-            bytesSaved: bytesSaved,
-            bytesSavedIsEstimate: bytesSavedIsEstimate
+            succeeded: imageVerified.count, failed: failures.count, errors: errors,
+            convertedSourceIDs: verified.sorted(), originalsRemovedSourceIDs: removed.sorted(),
+            retainedSourceIDs: removeOriginal ? requested.subtracting(removed).sorted() : [],
+            failedSourceIDs: failures.keys.sorted(),
+            originalsRemovalCanceled: removeOriginal && !requested.subtracting(removed).isEmpty,
+            bytesSaved: nil, bytesSavedIsEstimate: false, failureMessages: failures
         )
     }
 
-    // MARK: - Background task
-
-    private func beginBackgroundTaskIfNeeded() {
-        guard backgroundTaskID == .invalid else { return }
-        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "Live2Still.convert") { [weak self] in
-            self?.endBackgroundTaskIfNeeded()
-        }
-    }
-
-    private func endBackgroundTaskIfNeeded() {
-        guard backgroundTaskID != .invalid else { return }
-        UIApplication.shared.endBackgroundTask(backgroundTaskID)
-        backgroundTaskID = .invalid
-    }
-
-    // MARK: - Prepare (bounded parallelism)
-
-    private struct PrepareOutcome {
-        var prepared: [PreparedConversion]
-        var failed: Int
-        var errors: [Error]
-        var failedSourceIDs: [String]
-    }
-
-    private func prepareAssets(
-        _ assets: [PHAsset],
-        totalPhotos: Int,
-        progress: ((Int, Int) -> Void)?
-    ) async -> PrepareOutcome {
-        let total = assets.count
+    private func prepareAssets(_ assets: [PHAsset], allowNetwork: Bool) async -> (prepared: [PreparedConversion], errors: [String: Error]) {
         var prepared: [PreparedConversion] = []
-        prepared.reserveCapacity(total)
-        var prepareErrors: [Error] = []
-        var failedSourceIDs: [String] = []
-        var prepareFailed = 0
-        var completedCount = 0
-
+        var errors: [String: Error] = [:]
         await withTaskGroup(of: (String, Result<PreparedConversion, Error>).self) { group in
             var iterator = assets.makeIterator()
-
-            func enqueueNext() {
-                guard let asset = iterator.next() else { return }
-                let id = asset.localIdentifier
+            func enqueue() {
+                guard !Task.isCancelled, let asset = iterator.next() else { return }
                 group.addTask {
                     do {
-                        let item = try await Self.prepareConversion(for: asset)
-                        return (id, .success(item))
-                    } catch {
-                        return (id, .failure(error))
+                        guard asset.mediaSubtypes.contains(.photoLive) else { throw LivePhotoError.notLivePhoto }
+                        let file = try await PhotoResourceIO.currentStill(for: asset, allowNetwork: allowNetwork)
+                        return (asset.localIdentifier, .success(PreparedConversion(
+                            sourceAsset: asset, file: file, collectionIDs: Self.albumIDs(asset),
+                            isFavorite: asset.isFavorite, isHidden: asset.isHidden,
+                            sourceVersion: asset.modificationDate?.timeIntervalSince1970 ?? 0,
+                            originalFilename: PHAssetResource.assetResources(for: asset).first { $0.type == .photo }?.originalFilename
+                        )))
+                    } catch { return (asset.localIdentifier, .failure(error)) }
+                }
+            }
+            for _ in 0 ..< min(Self.prepareConcurrency, assets.count) { enqueue() }
+            for await (id, result) in group {
+                switch result { case .success(let item): prepared.append(item); case .failure(let error): errors[id] = error }
+                enqueue()
+            }
+        }
+        return (prepared, errors)
+    }
+
+    private func commitCreations(_ items: [PreparedConversion]) async throws -> [PreparedConversion] {
+        try await Task.detached {
+            let sizes = try items.map { Int64(try $0.file.url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) }
+            try PhotoResourceIO.checkDiskHeadroom(requiredBytes: sizes.reduce(0, +) + (sizes.max() ?? 0))
+        }.value
+        var outputIDs = Array<String?>(repeating: nil, count: items.count)
+        var journalError: Error?
+        try await PHPhotoLibrary.shared().performChanges {
+            let requests = items.map { _ in PHAssetCreationRequest.forAsset() }
+            for index in requests.indices { outputIDs[index] = requests[index].placeholderForCreatedAsset?.localIdentifier }
+            do {
+                guard outputIDs.allSatisfy({ $0 != nil }) else { throw LivePhotoError.savedStillNotVerifiable }
+                let records = items.indices.map { index in
+                    ConversionJournalRecord(sourceID: items[index].sourceAsset.localIdentifier, outputID: outputIDs[index]!,
+                                            sourceVersion: items[index].sourceVersion, digest: items[index].file.digest, stage: .creating)
+                }
+                try ConversionJournal.shared.update(records)
+            } catch {
+                journalError = error
+                // No resource is added if durable intent failed; empty creations cannot commit.
+                return
+            }
+            for index in items.indices {
+                let options = PHAssetResourceCreationOptions()
+                options.shouldMoveFile = false
+                options.originalFilename = items[index].originalFilename
+                requests[index].addResource(with: .photo, fileURL: items[index].file.url, options: options)
+                requests[index].creationDate = items[index].sourceAsset.creationDate
+                requests[index].location = items[index].sourceAsset.location
+            }
+        }
+        if let journalError { throw journalError }
+        var saved = items
+        for index in saved.indices { saved[index].outputID = outputIDs[index] }
+        try ConversionJournal.shared.update(saved.map { record($0, stage: .created) })
+        return saved
+    }
+
+    private func applyMetadata(_ items: [PreparedConversion]) async -> [String: Error] {
+        var failures: [String: Error] = [:]
+        var outputs: [String: PHAsset] = [:]
+        var collections: [String: PHAssetCollection] = [:]
+        let collectionIDs = Set(items.flatMap(\.collectionIDs))
+        PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: Array(collectionIDs), options: nil)
+            .enumerateObjects { collection, _, _ in collections[collection.localIdentifier] = collection }
+        var valid: [PreparedConversion] = []
+        for item in items {
+            do {
+                try Task.checkCancellation()
+                guard let id = item.outputID else { throw LivePhotoError.savedStillNotVerifiable }
+                let output = try await confirmedAsset(id)
+                guard output.canPerform(.properties), item.collectionIDs.allSatisfy({ collections[$0]?.canPerform(.addContent) == true }) else {
+                    throw LivePhotoError.metadataNotPreserved
+                }
+                outputs[id] = output
+                valid.append(item)
+            } catch { failures[item.sourceAsset.localIdentifier] = error }
+        }
+        guard !valid.isEmpty else { return failures }
+        do {
+            try Task.checkCancellation()
+            try await PHPhotoLibrary.shared().performChanges {
+                for item in valid {
+                    guard let id = item.outputID, let output = outputs[id] else { continue }
+                    let change = PHAssetChangeRequest(for: output)
+                    change.isFavorite = item.isFavorite
+                    change.isHidden = item.isHidden
+                    for collectionID in item.collectionIDs {
+                        if let collection = collections[collectionID] {
+                            PHAssetCollectionChangeRequest(for: collection)?.addAssets([output] as NSArray)
+                        }
                     }
                 }
             }
-
-            for _ in 0 ..< min(Self.prepareConcurrency, total) {
-                enqueueNext()
-            }
-
-            for await (id, result) in group {
-                completedCount += 1
-                switch result {
-                case .success(let item):
-                    prepared.append(item)
-                case .failure(let error):
-                    prepareFailed += 1
-                    prepareErrors.append(error)
-                    failedSourceIDs.append(id)
-                }
-
-                reportProgress(completed: completedCount, total: totalPhotos, callback: progress)
-
-                enqueueNext()
-            }
-        }
-
-        return PrepareOutcome(
-            prepared: prepared,
-            failed: prepareFailed,
-            errors: prepareErrors,
-            failedSourceIDs: failedSourceIDs
-        )
+        } catch { for item in valid { failures[item.sourceAsset.localIdentifier] = error } }
+        return failures
     }
 
-    private func reportProgress(
-        completed: Int,
-        total: Int,
-        callback: ((Int, Int) -> Void)?
-    ) {
-        let safeTotal = max(total, 1)
-        let clamped = min(max(completed, 0), safeTotal)
-        conversionProgress = (clamped, safeTotal)
-        callback?(clamped, safeTotal)
+    private func verifyImage(_ output: PHAsset, file: PhotoResourceFile) async throws {
+        guard output.mediaType == .image, !output.mediaSubtypes.contains(.photoLive),
+              output.pixelWidth == file.width, output.pixelHeight == file.height,
+              let resource = PHAssetResource.assetResources(for: output).first(where: { $0.type == .photo }) else {
+            throw LivePhotoError.outputDidNotMatch
+        }
+        let copied = try await PhotoResourceIO.copy(resource, allowNetwork: false)
+        defer { try? FileManager.default.removeItem(at: copied.url) }
+        guard copied.digest == file.digest else { throw LivePhotoError.outputDidNotMatch }
     }
 
-    nonisolated private static func prepareConversion(for asset: PHAsset) async throws -> PreparedConversion {
-        guard asset.mediaSubtypes.contains(.photoLive) else {
-            throw LivePhotoError.notLivePhoto
+    private func verifyMetadata(_ output: PHAsset, prepared: PreparedConversion) throws {
+        let source = prepared.sourceAsset
+        let datesMatch: Bool
+        switch (output.creationDate, source.creationDate) {
+        case (nil, nil): datesMatch = true
+        case (let a?, let b?): datesMatch = abs(a.timeIntervalSince(b)) < 0.01
+        default: datesMatch = false
         }
-
-        let photoResource = try photoResource(from: asset)
-        let (fileURL, stillBytes) = try await writePhotoResourceToTemporaryFile(photoResource)
-        let savings = LivePhotoStorageSavings.estimatedStorageSavings(
-            for: asset,
-            stillBytes: stillBytes
-        )
-
-        return PreparedConversion(
-            sourceAsset: asset,
-            fileURL: fileURL,
-            collectionIDs: albumLocalIdentifiers(containing: asset),
-            isFavorite: asset.isFavorite,
-            isHidden: asset.isHidden,
-            savedBytes: savings.savedBytes,
-            savedBytesIsEstimate: savings.isEstimate
-        )
+        let locationMatches: Bool
+        switch (output.location, source.location) {
+        case (nil, nil): locationMatches = true
+        case (let a?, let b?): locationMatches = a.distance(from: b) < 1 && abs(a.altitude - b.altitude) < 1
+        default: locationMatches = false
+        }
+        guard datesMatch, locationMatches, output.isFavorite == prepared.isFavorite, output.isHidden == prepared.isHidden,
+              Set(prepared.collectionIDs).isSubset(of: Set(Self.albumIDs(output))) else { throw LivePhotoError.metadataNotPreserved }
     }
 
-    // MARK: - Create stills (no deletes)
-
-    private func commitCreations(
-        prepared: [PreparedConversion]
-    ) async throws -> [PreparedConversion] {
-        var placeholderIDs: [String?] = Array(repeating: nil, count: prepared.count)
-
-        try await PHPhotoLibrary.shared().performChanges {
-            for index in prepared.indices {
-                let item = prepared[index]
-                let request = PHAssetCreationRequest.forAsset()
-                let options = PHAssetResourceCreationOptions()
-                options.shouldMoveFile = false
-                request.addResource(with: .photo, fileURL: item.fileURL, options: options)
-                request.creationDate = item.sourceAsset.creationDate
-                request.location = item.sourceAsset.location
-                placeholderIDs[index] = request.placeholderForCreatedAsset?.localIdentifier
-            }
-        }
-
-        return zip(prepared, placeholderIDs).map { item, placeholderID in
-            PreparedConversion(
-                sourceAsset: item.sourceAsset,
-                fileURL: item.fileURL,
-                collectionIDs: item.collectionIDs,
-                isFavorite: item.isFavorite,
-                isHidden: item.isHidden,
-                savedBytes: item.savedBytes,
-                savedBytesIsEstimate: item.savedBytesIsEstimate,
-                placeholderLocalIdentifier: placeholderID
-            )
-        }
+    private func record(_ item: PreparedConversion, stage: ConversionJournalRecord.Stage) -> ConversionJournalRecord {
+        ConversionJournalRecord(sourceID: item.sourceAsset.localIdentifier, outputID: item.outputID ?? "",
+                                sourceVersion: item.sourceVersion, digest: item.file.digest, stage: stage)
     }
 
-    private func deleteOriginals(assets: [PHAsset]) async throws {
-        let assetsToDelete = assets as NSArray
-        try await PHPhotoLibrary.shared().performChanges {
-            PHAssetChangeRequest.deleteAssets(assetsToDelete)
-        }
-    }
-
-    private static func confirmedRemovedIDs(_ ids: Set<String>) async -> Set<String> {
+    private func confirmedAsset(_ id: String) async throws -> PHAsset {
         for attempt in 0 ..< 4 {
-            let remaining = PHAsset.fetchAssets(withLocalIdentifiers: Array(ids), options: nil)
+            let options = PHFetchOptions()
+            options.includeHiddenAssets = true
+            if let asset = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: options).firstObject { return asset }
+            if attempt < 3 { try await Task.sleep(for: .milliseconds(250)) }
+        }
+        throw LivePhotoError.savedStillNotVerifiable
+    }
+
+    private func confirmedRemovedIDs(_ ids: Set<String>) async -> Set<String> {
+        for attempt in 0 ..< 4 {
+            let options = PHFetchOptions()
+            options.includeHiddenAssets = true
+            let remaining = PHAsset.fetchAssets(withLocalIdentifiers: Array(ids), options: options)
             var present: Set<String> = []
             remaining.enumerateObjects { asset, _, _ in present.insert(asset.localIdentifier) }
             if present.isEmpty || attempt == 3 { return ids.subtracting(present) }
@@ -395,262 +490,30 @@ final class LivePhotoConverter {
         return []
     }
 
-    private static func confirmedCreatedIDs(_ ids: Set<String>) async -> Set<String> {
-        guard !ids.isEmpty else { return [] }
-        var found: Set<String> = []
-        for attempt in 0 ..< 4 {
-            let assets = PHAsset.fetchAssets(withLocalIdentifiers: Array(ids), options: nil)
-            assets.enumerateObjects { asset, _, _ in found.insert(asset.localIdentifier) }
-            if found.count == ids.count || attempt == 3 { break }
-            try? await Task.sleep(for: .milliseconds(250))
-        }
-        return found
+    nonisolated private static func albumIDs(_ asset: PHAsset) -> [String] {
+        let collections = PHAssetCollection.fetchAssetCollectionsContaining(asset, with: .album, options: nil)
+        var ids: [String] = []
+        collections.enumerateObjects { collection, _, _ in ids.append(collection.localIdentifier) }
+        return ids
     }
 
-    private func applyBatchPostCreationMetadata(prepared: [PreparedConversion]) async throws {
-        let inputs = prepared.map {
-            PreparedMetadataInput(
-                placeholderLocalIdentifier: $0.placeholderLocalIdentifier,
-                collectionIDs: $0.collectionIDs,
-                isFavorite: $0.isFavorite,
-                isHidden: $0.isHidden
-            )
-        }
-        let payload = await Task.detached {
-            Self.buildMetadataPayload(inputs: inputs)
-        }.value
+    private func reportProgress(_ completed: Int, total: Int, _ callback: ((Int, Int) -> Void)?) {
+        conversionProgress = (completed, max(total, 1))
+        callback?(completed, total)
+    }
 
-        guard !payload.items.isEmpty else { return }
-
-        let createdIDs = payload.items.map(\.createdLocalID)
-        let createdAssets = PHAsset.fetchAssets(withLocalIdentifiers: createdIDs, options: nil)
-        var createdByID: [String: PHAsset] = [:]
-        createdAssets.enumerateObjects { asset, _, _ in
-            createdByID[asset.localIdentifier] = asset
-        }
-
-        let collectionsByID = Self.prefetchCollections(localIdentifiers: payload.collectionLocalIDs)
-
-        try await PHPhotoLibrary.shared().performChanges {
-            for item in payload.items {
-                guard let created = createdByID[item.createdLocalID] else { continue }
-
-                if item.isFavorite || item.isHidden {
-                    let changeRequest = PHAssetChangeRequest(for: created)
-                    changeRequest.isFavorite = item.isFavorite
-                    changeRequest.isHidden = item.isHidden
-                }
-
-                for collectionID in item.collectionIDs {
-                    guard let collection = collectionsByID[collectionID],
-                          let changeRequest = PHAssetCollectionChangeRequest(for: collection)
-                    else { continue }
-                    changeRequest.addAssets([created] as NSArray)
-                }
+    private func beginBackgroundTaskIfNeeded() {
+        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "Live2Still conversion") { [weak self] in
+            Task { @MainActor in
+                self?.cancel()
+                self?.endBackgroundTaskIfNeeded()
             }
         }
     }
 
-    private struct PreparedMetadataInput: Sendable {
-        let placeholderLocalIdentifier: String?
-        let collectionIDs: [String]
-        let isFavorite: Bool
-        let isHidden: Bool
-    }
-
-    private struct MetadataApplyItem: Sendable {
-        let createdLocalID: String
-        let collectionIDs: [String]
-        let isFavorite: Bool
-        let isHidden: Bool
-    }
-
-    private struct MetadataPayload: Sendable {
-        let items: [MetadataApplyItem]
-        let collectionLocalIDs: [String]
-    }
-
-    nonisolated private static func buildMetadataPayload(
-        inputs: [PreparedMetadataInput]
-    ) -> MetadataPayload {
-        let placeholderIDs = inputs.compactMap(\.placeholderLocalIdentifier)
-        guard !placeholderIDs.isEmpty else {
-            return MetadataPayload(items: [], collectionLocalIDs: [])
-        }
-
-        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: placeholderIDs, options: nil)
-        var createdByPlaceholder: [String: PHAsset] = [:]
-        fetchResult.enumerateObjects { asset, _, _ in
-            createdByPlaceholder[asset.localIdentifier] = asset
-        }
-
-        var applyItems: [MetadataApplyItem] = []
-        applyItems.reserveCapacity(inputs.count)
-        var collectionIDs = Set<String>()
-
-        for item in inputs {
-            guard let placeholderID = item.placeholderLocalIdentifier,
-                  createdByPlaceholder[placeholderID] != nil
-            else { continue }
-
-            applyItems.append(
-                MetadataApplyItem(
-                    createdLocalID: placeholderID,
-                    collectionIDs: item.collectionIDs,
-                    isFavorite: item.isFavorite,
-                    isHidden: item.isHidden
-                )
-            )
-            collectionIDs.formUnion(item.collectionIDs)
-        }
-
-        return MetadataPayload(
-            items: applyItems,
-            collectionLocalIDs: Array(collectionIDs)
-        )
-    }
-
-    nonisolated private static func prefetchCollections(
-        localIdentifiers: [String]
-    ) -> [String: PHAssetCollection] {
-        guard !localIdentifiers.isEmpty else { return [:] }
-
-        var collectionsByID: [String: PHAssetCollection] = [:]
-        let fetchResult = PHAssetCollection.fetchAssetCollections(
-            withLocalIdentifiers: localIdentifiers,
-            options: nil
-        )
-        fetchResult.enumerateObjects { collection, _, _ in
-            collectionsByID[collection.localIdentifier] = collection
-        }
-        return collectionsByID
-    }
-
-    private func cleanupTemporaryFiles(_ prepared: [PreparedConversion]) {
-        for item in prepared {
-            try? FileManager.default.removeItem(at: item.fileURL)
-        }
-    }
-
-    // MARK: - Resource extraction
-
-    nonisolated private static func photoResource(from asset: PHAsset) throws -> PHAssetResource {
-        let resources = PHAssetResource.assetResources(for: asset)
-        guard let photo = resources.first(where: { $0.type == .photo })
-            ?? resources.first(where: { $0.type == .fullSizePhoto }) else {
-            throw LivePhotoError.photoResourceMissing
-        }
-        return photo
-    }
-
-    nonisolated private static func fileExtension(for resource: PHAssetResource) -> String {
-        let utiString = resource.uniformTypeIdentifier
-        if let type = UTType(utiString), let ext = type.preferredFilenameExtension {
-            return ext
-        }
-        let original = resource.originalFilename as NSString
-        let ext = original.pathExtension
-        if !ext.isEmpty {
-            return ext.lowercased()
-        }
-        return "jpg"
-    }
-
-    nonisolated private static func writePhotoResourceToTemporaryFile(
-        _ resource: PHAssetResource
-    ) async throws -> (URL, Int64) {
-        let ext = fileExtension(for: resource)
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent(UUID().uuidString)
-            .appendingPathExtension(ext)
-
-        let bytesWritten = try await streamResourceToFile(resource, destination: url)
-        guard bytesWritten > 0, isValidImage(at: url) else {
-            try? FileManager.default.removeItem(at: url)
-            throw LivePhotoError.invalidImageData
-        }
-
-        return (url, bytesWritten)
-    }
-
-    nonisolated private static func streamResourceToFile(
-        _ resource: PHAssetResource,
-        destination: URL
-    ) async throws -> Int64 {
-        FileManager.default.createFile(atPath: destination.path, contents: nil)
-        let handle = try FileHandle(forWritingTo: destination)
-        defer { try? handle.close() }
-
-        return try await withCheckedThrowingContinuation { continuation in
-            let resumeGuard = ContinuationResumeOnceGuard(continuation: continuation)
-            var totalBytes: Int64 = 0
-            let options = PHAssetResourceRequestOptions()
-            options.isNetworkAccessAllowed = true
-
-            PHAssetResourceManager.default().requestData(
-                for: resource,
-                options: options,
-                dataReceivedHandler: { chunk in
-                    do {
-                        try handle.write(contentsOf: chunk)
-                        totalBytes += Int64(chunk.count)
-                    } catch {
-                        resumeGuard.resume(throwing: error)
-                    }
-                },
-                completionHandler: { error in
-                    if let error {
-                        resumeGuard.resume(throwing: error)
-                    } else {
-                        resumeGuard.resume(returning: totalBytes)
-                    }
-                }
-            )
-        }
-    }
-
-    nonisolated private static func isValidImage(at url: URL) -> Bool {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
-            return false
-        }
-        return CGImageSourceGetCount(source) > 0
-    }
-
-    nonisolated private static func albumLocalIdentifiers(containing asset: PHAsset) -> [String] {
-        var ids: [String] = []
-        let userCollections = PHAssetCollection.fetchAssetCollectionsContaining(
-            asset,
-            with: .album,
-            options: nil
-        )
-        userCollections.enumerateObjects { collection, _, _ in
-            ids.append(collection.localIdentifier)
-        }
-        return ids
-    }
-}
-
-private final class ContinuationResumeOnceGuard<T>: @unchecked Sendable {
-    private let lock = NSLock()
-    nonisolated(unsafe) private var continuation: CheckedContinuation<T, Error>?
-
-    nonisolated init(continuation: CheckedContinuation<T, Error>) {
-        self.continuation = continuation
-    }
-
-    nonisolated func resume(returning value: T) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let continuation else { return }
-        self.continuation = nil
-        continuation.resume(returning: value)
-    }
-
-    nonisolated func resume(throwing error: Error) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let continuation else { return }
-        self.continuation = nil
-        continuation.resume(throwing: error)
+    private func endBackgroundTaskIfNeeded() {
+        guard backgroundTaskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTaskID)
+        backgroundTaskID = .invalid
     }
 }

@@ -54,7 +54,7 @@ struct LivePhotoLaunchShellView: View {
                     .font(.title2.weight(.semibold))
                     .multilineTextAlignment(.center)
 
-                Text("Turn Live Photos into stills and free up storage.")
+                Text("Save still copies and review Live Photos in batches.")
                     .font(.body)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)

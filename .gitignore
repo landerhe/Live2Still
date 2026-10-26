@@ -1,0 +1,29 @@
+# Xcode & Apple OS build artifacts
+.DS_Store
+*/.DS_Store
+xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+build/
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.pbxuser
+*.xcuserstate
+*.xcresult
+*.hmap
+*.dSYM/
+*.ipa
+*.zip
+
+# Fastlane / CI / Test intermediate
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+fastlane/test_output
+
+# Local agent & audit scratch files
+*.audit*
+*AUDIT*
+*audit/
+*.log

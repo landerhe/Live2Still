@@ -57,7 +57,12 @@ struct LivePhotoSelectionCell: View {
         switch thumbnailState {
         case .loading:
             Color(.secondarySystemBackground)
-                .overlay { ProgressView().accessibilityLabel("Loading thumbnail") }
+                .overlay {
+                    Image(systemName: "photo")
+                        .font(.title3)
+                        .foregroundStyle(.tertiary)
+                }
+                .accessibilityLabel("Loading thumbnail")
         case .loaded(let thumbnail):
             Image(uiImage: thumbnail)
                 .resizable()

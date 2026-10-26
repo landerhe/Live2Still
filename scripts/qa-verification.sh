@@ -27,11 +27,11 @@ UX:
   - Album Queue badge opens queue sheet (not Swipe-only)
   - Queue Apply: progress visible; sheet dismisses when done
   - Denied screen: primary button is Open Settings (not misleading Allow)
-  - Welcome Continue works while library is still scanning
+  - First-use retention choice explicitly defaults to keeping originals
   - Select All shows confirmation with count
   - Swipe Undo restores last card
-  - Swipe Again keeps existing queue
-  - Long-press album cell opens preview; hold plays Live motion
+  - Continue Next Batch excludes reviewed IDs; Review Again preserves pending queues
+  - Tap album cell opens preview; hold plays Live motion
   - Cancel system delete after convert: stills remain
   - About → Privacy Policy opens in-app
 
@@ -42,7 +42,17 @@ Accessibility:
 Regression:
   - Convert 1/N with/without remove original
   - Limited library: Add Photos
-  - Partial batch failure → Retry retries failed IDs only
+  - Partial batch failure → Retry retries failed IDs only; Last Conversion survives relaunch
+  - Queued Still/Delete decisions survive relaunch in Swipe and Clean Up
+  - Keep cancels an earlier queued action; Undo restores the earlier checked state
+  - Edited/current-key-photo output matches what Photos displays
+  - Date/location/favorite/hidden/albums verified before removal
+  - Conversion: cancel, background expiration, force quit, low disk; originals retained
+  - Deleted/unverifiable earlier output: no silent duplicate; explicit fresh-copy/keep choice
+  - Local/cloud scope changes preserve pending actions outside display scope
+  - Clean Up: left=still (Live only), right=keep, down=delete; Undo has a separate button
+  - Analysis failures are retryable and are not cached as no matches
+  - Release requires real-device iCloud/edited/key-photo material and accessibility checks
   - Offline / On this device only filter
 
 App Store listing:

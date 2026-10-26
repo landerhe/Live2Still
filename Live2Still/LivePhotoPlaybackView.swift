@@ -85,6 +85,7 @@ struct LivePhotoSwipeCardContent: View {
     @State private var livePhoto: PHLivePhoto?
     @State private var isLoadingLivePhoto = false
     @State private var livePhotoUnavailable = false
+    @State private var livePhotoLoadTask: Task<Void, Never>?
 
     private var targetSize: CGSize {
         LivePhotoThumbnailSizing.targetSize(
@@ -158,11 +159,20 @@ struct LivePhotoSwipeCardContent: View {
             onDelete?()
         }
         .onChange(of: isPressingLive) { _, pressing in
-            guard isTop, pressing else { return }
-            Task { await loadLivePhotoIfNeeded() }
+            guard isTop else { return }
+            livePhotoLoadTask?.cancel()
+            guard pressing else {
+                livePhotoLoadTask = nil
+                isLoadingLivePhoto = false
+                return
+            }
+            isLoadingLivePhoto = false
+            livePhotoLoadTask = Task { await loadLivePhotoIfNeeded() }
         }
         .onChange(of: isTop) { _, nowTop in
             if !nowTop {
+                livePhotoLoadTask?.cancel()
+                livePhotoLoadTask = nil
                 isPressingLive = false
                 livePhoto = nil
                 isLoadingLivePhoto = false
@@ -170,24 +180,33 @@ struct LivePhotoSwipeCardContent: View {
             }
         }
         .onChange(of: item.id) { _, _ in
+            livePhotoLoadTask?.cancel()
+            livePhotoLoadTask = nil
             livePhoto = nil
             isLoadingLivePhoto = false
             livePhotoUnavailable = false
             isPressingLive = false
         }
+        .onDisappear {
+            livePhotoLoadTask?.cancel()
+            livePhotoLoadTask = nil
+        }
     }
 
     private func loadLivePhotoIfNeeded() async {
         guard isTop, livePhoto == nil, !isLoadingLivePhoto else { return }
+        let requestedID = item.id
         isLoadingLivePhoto = true
         livePhotoUnavailable = false
-        defer { isLoadingLivePhoto = false }
-        livePhoto = await store.requestLivePhoto(
+        let result = await store.requestLivePhoto(
             for: item.asset,
             targetSize: targetSize,
             contentMode: .aspectFit
         )
-        livePhotoUnavailable = livePhoto == nil
+        guard !Task.isCancelled, isTop, item.id == requestedID else { return }
+        livePhoto = result
+        livePhotoUnavailable = result == nil
+        isLoadingLivePhoto = false
     }
 }
 

@@ -6,17 +6,19 @@
 import Photos
 import SwiftUI
 
-/// Full-screen still preview opened by long-pressing an album cell. Hold to play Live motion.
+/// Full-screen still preview. Hold to play Live motion.
 struct LivePhotoAlbumPreviewView: View {
     let item: LivePhotoItem
     let store: LivePhotoLibraryStore
     let onDismiss: () -> Void
+    let onReview: () -> Void
 
     @Environment(\.displayScale) private var displayScale
     @State private var isPressingLive = false
     @State private var livePhoto: PHLivePhoto?
     @State private var isLoadingLivePhoto = false
     @State private var livePhotoUnavailable = false
+    @State private var livePhotoLoadTask: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
@@ -66,7 +68,10 @@ struct LivePhotoAlbumPreviewView: View {
                     pressing: { pressing in
                         isPressingLive = pressing
                         if pressing {
-                            Task { await loadLivePhotoIfNeeded(container: container) }
+                            livePhotoLoadTask = Task { await loadLivePhotoIfNeeded(container: container) }
+                        } else {
+                            livePhotoLoadTask?.cancel()
+                            isLoadingLivePhoto = false
                         }
                     },
                     perform: {}
@@ -75,35 +80,41 @@ struct LivePhotoAlbumPreviewView: View {
                 .accessibilityHint("Press and hold to play motion")
                 .accessibilityAction(named: "Play Live Photo") {
                     isPressingLive = true
-                    Task { await loadLivePhotoIfNeeded(container: container) }
+                    livePhotoLoadTask = Task { await loadLivePhotoIfNeeded(container: container) }
                 }
             }
             .navigationTitle("Preview")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
+                ToolbarItem(placement: .topBarLeading) {
                     Button("Done", action: onDismiss)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Review", action: onReview)
                 }
             }
             .toolbarBackground(.visible, for: .navigationBar)
         }
+        .onDisappear { livePhotoLoadTask?.cancel() }
     }
 
     private func loadLivePhotoIfNeeded(container: CGSize) async {
         guard livePhoto == nil, !isLoadingLivePhoto else { return }
         isLoadingLivePhoto = true
         livePhotoUnavailable = false
-        defer { isLoadingLivePhoto = false }
 
         let targetSize = LivePhotoThumbnailSizing.targetSize(
             container: container,
             displayScale: displayScale
         )
-        livePhoto = await store.requestLivePhoto(
+        let result = await store.requestLivePhoto(
             for: item.asset,
             targetSize: targetSize,
             contentMode: .aspectFit
         )
-        livePhotoUnavailable = livePhoto == nil
+        guard !Task.isCancelled else { return }
+        livePhoto = result
+        livePhotoUnavailable = result == nil
+        isLoadingLivePhoto = false
     }
 }

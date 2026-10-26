@@ -13,6 +13,14 @@ struct LivePhotoQueuedReviewSheet: View {
     var summaryMessage: String?
     var attentionIDs: Set<String> = []
     var onApply: (() -> Void)?
+    var operationStage = ""
+    var onCancel: (() -> Void)?
+    @Binding var showApplyConfirmation: Bool
+    var confirmationTitle: String
+    var confirmationMessage: String
+    var onConfirmApply: () -> Void
+    var onCancelApply: () -> Void
+    var failureMessages: [String: String] = [:]
     @Environment(\.dismiss) private var dismiss
     @Environment(\.displayScale) private var displayScale
 
@@ -25,7 +33,12 @@ struct LivePhotoQueuedReviewSheet: View {
     }
 
     private var hasAnyQueued: Bool {
-        !convertItems.isEmpty || !deleteItems.isEmpty
+        !session.convertQueueOrder.isEmpty || !session.deleteQueueOrder.isEmpty
+    }
+
+    private var hasAvailableSelection: Bool {
+        convertItems.contains { session.convertQueue.contains($0.id) }
+            || deleteItems.contains { session.deleteQueue.contains($0.id) }
     }
 
     var body: some View {
@@ -40,11 +53,20 @@ struct LivePhotoQueuedReviewSheet: View {
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 20) {
+                            let unavailable = session.convertQueueOrder.count + session.deleteQueueOrder.count - convertItems.count - deleteItems.count
+                            if unavailable > 0 {
+                                Text("\(unavailable) queued photo(s) are outside the current scope or access, or their full images are not on this device. Your decisions are saved. Clear them from the queue if you no longer want to process them.")
+                                    .font(.subheadline).foregroundStyle(.secondary).padding(.horizontal, 14)
+                            }
                             if let summaryMessage {
+                                Text("Last Apply").font(.headline)
                                 Text(summaryMessage)
                                     .font(.subheadline)
                                     .foregroundStyle(attentionIDs.isEmpty ? Color.secondary : Color.orange)
                                     .padding(.horizontal, 14)
+                            }
+                            ForEach(Array(Set(failureMessages.values)).sorted(), id: \.self) { reason in
+                                Text(reason).font(.subheadline).foregroundStyle(.orange)
                             }
                             if !convertItems.isEmpty {
                                 queueSection(
@@ -72,8 +94,24 @@ struct LivePhotoQueuedReviewSheet: View {
                     }
                 }
             }
+            .disabled(isProcessing)
+            .safeAreaInset(edge: .top) {
+                if let error = session.persistenceError {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(error).font(.subheadline).foregroundStyle(.orange)
+                        Button("Retry Saving Review") { session.retryPersistence() }
+                            .disabled(isProcessing)
+                    }.padding(16)
+                }
+            }
             .navigationTitle("Queue")
             .navigationBarTitleDisplayMode(.inline)
+            .confirmationDialog("Apply queue?", isPresented: $showApplyConfirmation, titleVisibility: .visible) {
+                Button(confirmationTitle, role: .destructive, action: onConfirmApply)
+                Button("Cancel", role: .cancel, action: onCancelApply)
+            } message: {
+                Text(confirmationMessage)
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Done") {
@@ -110,13 +148,19 @@ struct LivePhotoQueuedReviewSheet: View {
                                     session.removeDeleteQueuedEntirely(ids: deleteItems.map(\.id))
                                 }
                             }
+                            Button("Clear Queue", role: .destructive) {
+                                session.removeConvertQueuedEntirely(ids: session.convertQueueOrder)
+                                session.removeDeleteQueuedEntirely(ids: session.deleteQueueOrder)
+                            }
                         } label: {
                             Image(systemName: "checkmark.circle")
                         }
+                        .disabled(isProcessing)
                         .accessibilityLabel("Selection options")
                     }
                 }
             }
+            .interactiveDismissDisabled(isProcessing)
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 if hasAnyQueued {
                     queueSheetActionBar
@@ -127,6 +171,10 @@ struct LivePhotoQueuedReviewSheet: View {
 
     private var queueSheetActionBar: some View {
         VStack(spacing: 10) {
+            if isProcessing {
+                ProgressView(operationStage.isEmpty ? "Applying confirmed changes…" : operationStage)
+                if let onCancel { Button("Stop After Current Transaction", action: onCancel) }
+            }
             Toggle("Remove original Live Photo", isOn: $removeOriginal)
                 .font(LivePhotoDesign.actionBarFont)
                 .disabled(isProcessing || convertItems.isEmpty)
@@ -159,10 +207,10 @@ struct LivePhotoQueuedReviewSheet: View {
 
     private var queueSummaryText: some View {
         VStack(alignment: .leading, spacing: 2) {
-            if !convertItems.isEmpty {
+            if !session.convertQueueOrder.isEmpty {
                 Text(convertSectionSummary)
             }
-            if !deleteItems.isEmpty {
+            if !session.deleteQueueOrder.isEmpty {
                 Text(deleteSectionSummary)
             }
         }
@@ -184,7 +232,7 @@ struct LivePhotoQueuedReviewSheet: View {
                 }
             }
             .buttonStyle(.glassProminent)
-            .disabled(isProcessing || session.queuedActionCount == 0)
+            .disabled(isProcessing || session.queuedActionCount == 0 || !hasAvailableSelection)
             .accessibilityHint("Applies selected still conversions and deletions")
         }
     }
@@ -273,7 +321,7 @@ private struct QueuedSelectableCell: View {
             onTap: onTap,
             onRetry: thumbnailState.isFailed ? { Task { await loadThumbnail(forceLoading: true) } } : nil
         )
-        .task(id: item.id) {
+        .task(id: "\(item.id)-\(item.asset.modificationDate?.timeIntervalSince1970 ?? 0)") {
             await loadThumbnail(forceLoading: thumbnailState.image == nil)
         }
     }
